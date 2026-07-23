@@ -3,69 +3,68 @@
 <head>
   <title>MEP AR - Marker Test</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@1.2.5/dist/mindar-image-three.prod.js"></script>
   <script type="importmap">
     {
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.147.0/examples/jsm/",
-        "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.module.js"
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.147.0/examples/jsm/"
       }
     }
   </script>
   <style>
     body { margin: 0; overflow: hidden; }
-    #ar-container { width: 100vw; height: 100vh; position: relative; }
     #info {
-      position: absolute; top: 10px; left: 10px; z-index: 10;
+      position: fixed; top: 10px; left: 10px; z-index: 10;
       background: rgba(0,0,0,0.6); color: white; padding: 8px 12px;
       border-radius: 4px; font-family: sans-serif; font-size: 14px;
     }
   </style>
 </head>
 <body>
-  <div id="info">마커를 카메라로 비추세요</div>
-  <div id="ar-container"></div>
+  <div id="info">로딩 중...</div>
 
   <script type="module">
     import * as THREE from 'three';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-    import { MindARThree } from 'mindar-image-three';
 
-    const start = async () => {
-      const mindarThree = new MindARThree({
-        container: document.querySelector("#ar-container"),
-        imageTargetSrc: './targets.mind',
-      });
+    document.addEventListener('DOMContentLoaded', () => {
+      const start = async () => {
+        const mindarThree = new window.MINDAR.IMAGE.MindARThree({
+          container: document.body,
+          imageTargetSrc: './targets.mind',
+        });
 
-      const { renderer, scene, camera } = mindarThree;
-      const anchor = mindarThree.addAnchor(0);
+        const { renderer, scene, camera } = mindarThree;
+        const anchor = mindarThree.addAnchor(0);
 
-      const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-      scene.add(light);
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
 
-      const loader = new GLTFLoader();
-      loader.load('./mep_test.glb', (gltf) => {
-        const model = gltf.scene;
-        model.scale.set(0.1, 0.1, 0.1);
-        model.position.set(0, 0, 0);
-        anchor.group.add(model);
-        document.querySelector("#info").innerText = "모델 로드 완료. 마커를 비추세요";
-      });
+        const loader = new GLTFLoader();
+        loader.load('./mep_test.glb', (gltf) => {
+          const model = gltf.scene;
+          model.scale.set(0.1, 0.1, 0.1);
+          model.position.set(0, 0, 0);
+          anchor.group.add(model);
+          document.querySelector("#info").innerText = "마커를 비추세요";
+        });
 
-      anchor.onTargetFound = () => {
-        document.querySelector("#info").innerText = "마커 인식됨 ✓";
+        anchor.onTargetFound = () => {
+          document.querySelector("#info").innerText = "마커 인식됨 ✓";
+        };
+        anchor.onTargetLost = () => {
+          document.querySelector("#info").innerText = "마커를 다시 비추세요";
+        };
+
+        await mindarThree.start();
+        renderer.setAnimationLoop(() => {
+          renderer.render(scene, camera);
+        });
       };
-      anchor.onTargetLost = () => {
-        document.querySelector("#info").innerText = "마커를 다시 비추세요";
-      };
 
-      await mindarThree.start();
-      renderer.setAnimationLoop(() => {
-        renderer.render(scene, camera);
-      });
-    };
-
-    start();
+      start();
+    });
   </script>
 </body>
 </html>
