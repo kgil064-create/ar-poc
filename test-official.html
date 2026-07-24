@@ -1,0 +1,102 @@
+<!--
+  test-official.html — MindAR 공식 예제(example1.html) 그대로 복제 + CDN 경로만 치환
+
+  원본: https://github.com/hiukim/mind-ar-js/blob/master/examples/image-tracking/example1.html
+  목적: 우리 ar.html 문제인지, 라이브러리/환경 문제인지 판별하는 대조군.
+
+  원본에서 바꾼 것은 아래 3가지 "경로"뿐. 구조/속성/좌표는 한 글자도 안 건드림.
+    1) <script src="../../src/image-target/aframe.js" type="module">  (저장소 소스, 우리 환경엔 없음)
+       → https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js   (HTTP 200 확인)
+    2) ./assets/card-example/*  (저장소 로컬 파일)
+       → https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@master/examples/... (전부 HTTP 200 확인)
+    3) 맨 아래 최소 상태표시 <script> 추가 (PC 콘솔 없이도 인식 여부 보이게)
+
+  [실험 결과 2026-07-24] 이 파일은 정상 작동 확인됨 (카드 + 캐릭터 모델 표시 성공).
+  A-Frame 버전을 1.4.1 / 1.6.0 양쪽으로 바꿔가며 테스트 → 둘 다 정상.
+  따라서 A-Frame 버전은 원인이 아니며, 라이브러리 조합 자체도 정상.
+  현재 20번 줄은 1.6.0 (우리 ar.html 과 동일 버전으로 맞춰둔 상태).
+
+  → 이 파일은 다음 세션의 "대조군"이므로 함부로 수정하지 말 것.
+    자세한 경위는 HANDOFF.md 참조.
+-->
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/stats.js/16/Stats.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+
+    <style>
+      body {
+        margin: 0;
+      }
+      .example-container {
+        overflow: hidden;
+        position: absolute;
+        width: 100%;
+        height: 100%;
+      }
+      /* 최소 상태 표시 (공식 예제엔 없음) */
+      #s {
+        position: fixed; top: 0; left: 0; z-index: 999;
+        background: rgba(0,0,0,.7); color: #fff;
+        font: 700 16px sans-serif; padding: 6px 10px;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="s">로딩 중...</div>
+
+    <div class="example-container">
+      <a-scene mindar-image="imageTargetSrc: https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@master/examples/image-tracking/assets/card-example/card.mind; showStats: true;" embedded color-space="sRGB" renderer="colorManagement: true, physicallyCorrectLights" vr-mode-ui="enabled: false" device-orientation-permission-ui="enabled: false">
+        <a-assets>
+          <img id="card" src="https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@master/examples/image-tracking/assets/card-example/card.png" />
+          <a-asset-item id="avatarModel" src="https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@master/examples/image-tracking/assets/card-example/softmind/scene.gltf"></a-asset-item>
+        </a-assets>
+
+        <a-camera position="0 0 0" look-controls="enabled: false"></a-camera>
+
+        <a-entity mindar-image-target="targetIndex: 0">
+          <a-plane src="#card" position="0 0 0" height="0.552" width="1" rotation="0 0 0"></a-plane>
+
+          <a-gltf-model rotation="0 0 0 " position="0 0 0.1" scale="0.005 0.005 0.005" src="#avatarModel"
+            animation="property: position; to: 0 0.1 0.1; dur: 1000; easing: easeInOutQuad; loop: true; dir: alternate"
+          >
+        </a-entity>
+      </a-scene>
+    </div>
+
+    <!-- 최소 상태 표시 (공식 예제엔 없음). 인식 여부만 화면에 보여줌. -->
+    <script>
+      var s = document.getElementById('s');
+      var f = 0, l = 0;
+      function show(t, c) { s.textContent = t; s.style.background = c; }
+      show('로딩 중... (A-Frame ' + (window.AFRAME ? AFRAME.version : '없음')
+           + ' / MindAR ' + (window.MINDAR ? 'OK' : '없음') + ')', 'rgba(0,0,0,.7)');
+      window.addEventListener('error', function (e) {
+        show('에러: ' + e.message, 'rgba(180,0,0,.9)');
+        console.error(e);
+      });
+      var sc = document.querySelector('a-scene');
+      sc.addEventListener('arReady', function () {
+        show('AR 준비됨 — 카드 마커를 비추세요', 'rgba(0,0,0,.7)');
+        console.log('arReady');
+      });
+      sc.addEventListener('arError', function (e) {
+        show('AR 시작 실패', 'rgba(180,0,0,.9)');
+        console.error('arError', e);
+      });
+      document.querySelector('[mindar-image-target]')
+        .addEventListener('targetFound', function () {
+          f++; show('● 인식 중  (Found ' + f + ' / Lost ' + l + ')', 'rgba(0,150,60,.9)');
+          console.log('targetFound', f);
+        });
+      document.querySelector('[mindar-image-target]')
+        .addEventListener('targetLost', function () {
+          l++; show('○ 놓침  (Found ' + f + ' / Lost ' + l + ')', 'rgba(90,90,90,.9)');
+          console.log('targetLost', l);
+        });
+    </script>
+  </body>
+</html>
