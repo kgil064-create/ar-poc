@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="ko">
+<!--
+  xr-test-3.html — 역방향 증분 3단계: MindAR 인식 엔진 + WebXR anchor 결합
+
+  목적:
+    기존 `targets.mind` 로 **마커를 1회 인식**하고, 그 포즈에 WebXR anchor 를 만들고,
+    MindAR 을 끈 뒤 **ARCore 추적만으로 유지**되는지 증명한다.
+
+  ⚠️ 이 단계의 합격선은 "**인식이 되는가 + anchor 가 생기는가**" 다.
+     위치 정확도(±15cm)는 4단계 과제이며 이 파일로 판정하지 않는다.
+     이유: 아래 FOV 보정과 마커 실측 폭이 둘 다 맞아야 정확도가 나오는데,
+     마커 실측 폭은 사용자가 재서 넣어줘야 하는 값이다.
+
+  ───────────────────────────────────────────────────────────────────────
+  이어받은 것 / 새로 작성한 것
+
+   [xr-test-2.html 에서 그대로]  anchor 생성·포즈 갱신·trackedAnchors 상실 감지, HUD, 로그창
+   [xr-test.html 에서 그대로]    renderer.xr.getCameraTexture(view.camera) 로 카메라 텍스처 획득
+
+   [새로 작성] ① WebGLTexture → 2D canvas blit  (조사 때 "최대 기술 리스크"로 꼽은 부분)
+   [새로 작성] ② MindAR Controller 직접 구동 (A-Frame 없이)
+   [새로 작성] ③ MindAR 포즈 → WebXR 기준공간 변환 + FOV 보정
+
+  ───────────────────────────────────────────────────────────────────────
+  MindAR 소스에서 확인한 사실 (추측 아님. HANDOFF.md §4-A 에도 기록)
+
+   • mindar-image.prod.js 는 **ES 모듈**(266 bytes shim). 형제 청크를 상대경로로 import
+     하므로 CDN 절대경로로 로드하면 자동 해결된다. Worker 는 base64→Blob 인라인이라
+     CDN 에서 깨지지 않는다. tfjs 도 번들에 포함.
+
+   • Controller API (src/image-target/controller.js):
+       new Controller({inputWidth, inputHeight, ...})
+       await addImageTargets(url)  →  { dimensions: [[w,h], ...] }
+       await dummyRun(input)       ← tf 워밍업. 안 하면 첫 detect 가 매우 느리다
+       await detect(input)         →  { featurePoints }    input 은 canvas/video/image
+       await match(fp, targetIdx)  →  { modelViewTransform }  (못 찾으면 null)
+       getWorldMatrix(mvt, idx)    →  16개 배열 (column-major)
+
+   • 포즈 변환 (src/image-target/three.js 와 동일하게):
+       M_카메라_마커 = Matrix4(worldMatrix) × postMatrix
+       postMatrix = compose(
+         position(markerW/2, markerW/2 + (markerH - markerW)/2, 0),
+         quaternion(identity),
+         scale(markerW, markerW, markerW) )
+     → 결과는 **카메라(view) 공간**, GL 규약. 그룹 로컬에서 **마커 가로폭 = 1 단위**.
+
+   • 🔴 MindAR 은 수직 FOV 를 **45° 로 하드코딩**한다 (controller.js:38)
+       const fovy = 45°;  const f = (inputHeight/2) / tan(fovy/2);
+     핀홀에서 Z = f·S/s 이므로 가정 f 가 틀리면 거리가 비례해서 틀어진다.
+       Z_실제 = Z_MindAR × (f_실제 / f_가정)
+       f_가정 ↔ proj[5] = 1/tan(22.5°) = 2.41421  (아래 MINDAR_PROJ_11)
+       f_실제 ↔ view.projectionMatrix[5]  ← WebXR 이 알려준다
+     A-Frame 판에서는 MindARThree.resize() 가 three 카메라 FOV 를 MindAR 쪽에
+     맞춰버려서 이 오차가 안 드러났다. WebXR 은 카메라 투영을 못 고치므로
+     **반대로 포즈를 보정한다.**
+  ───────────────────────────────────────────────────────────────────────
+  URL 파라미터 (코드 수정 없이 현장에서 조절)
+
+    ?mw=0.148     인쇄된 마커 실제 가로폭(m). 기본 0.10
+                  🔴 이 값이 틀리면 anchor 가 엉뚱한 거리에 생긴다. 자로 재서 넣을 것.
+    ?scale=0.5    캡처 축소 배율. 1=원본(886×1920). 느리면 0.5
+    ?interval=500 detect 시도 간격(ms). 기본 400
+    ?nofov=1      FOV 보정 끄기 (보정 전/후 비교용)
+    ?flip=0 / 1   캡처 상하 반전 고정. 기본은 자동(12회 실패마다 토글)
+  ───────────────────────────────────────────────────────────────────────
+-->
+	<head>
+		<title>xr-test 3단계 — MindAR + anchor</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
+		<style>
+			* { box-sizing: border-box; }
+			body {
+				margin: 0; overflow: hidden; background: #000; color: #fff;
+				font-family: -apple-system, "Malgun Gothic", monospace, sans-serif;
+			}
+			#info {
+				position: absolute; top: 0; width: 100%; padding: 10px;
+				text-align: center; pointer-events: none; z-index: 1;
+				font-size: 13px; line-height: 1.5; user-select: none;
+			}
+			#logbox {
+				position: fixed; left: 8px; right: 8px; bottom: 8px; z-index: 40;
+				max-height: 60vh; overflow-y: auto;
+				background: rgba(0,0,0,.92); color: #b6ffb6; border: 1px solid #0a0;
+				border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px;
+				line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+			}
+			#logbox .e  { color: #ff8080; font-weight: bold; }
+			#logbox .w  { color: #ffd280; }
+			#logbox .ok { color: #7fff7f; font-weight: bold; }
+
+			#xrHud {
+				position: absolute; top: 0; left: 0; right: 0;
+				background: rgba(0,0,0,.75); color: #fff;
+				padding: 12px 56px 12px 12px;
+				font-family: monospace; font-size: 15px; font-weight: 700;
+				line-height: 1.45; white-space: pre-line;
+			}
+			#xrHud .d    { color: #7fdcff; }
+			#xrHud .good { color: #7fff7f; }
+			#xrHud .warn { color: #ffb0b0; }
+			#xrExit {
+				position: absolute; top: 10px; right: 10px;
+				width: 38px; height: 38px; border-radius: 19px;
+				background: rgba(0,0,0,.6); color: #fff;
+				border: 2px solid #fff; font-size: 18px; font-weight: bold;
+				line-height: 1; padding: 0;
+			}
+		</style>
+	</head>
+	<body>
+
+		<div id="info">
+			3단계 검증: MindAR 인식 → WebXR anchor<br/>
+			<small>인쇄한 마커를 바닥에 놓고 비추세요</small>
+		</div>
+
+		<div id="logbox"></div>
+
+		<div id="xrOverlay" style="display:none">
+			<div id="xrHud">초기화 중...</div>
+			<button id="xrExit" title="AR 종료">✕</button>
+		</div>
+
+		<!-- ================= [진단] 화면 내 로그 ================= -->
+		<script>
+		(function () {
+			'use strict';
+			var logbox = document.getElementById('logbox');
+			var n = 0;
+			window.xrlog = function (msg, kind) {
+				n++;
+				var d = document.createElement('div');
+				if (kind) d.className = kind;
+				d.textContent = '[' + n + '] ' + msg;
+				logbox.appendChild(d);
+				logbox.scrollTop = logbox.scrollHeight;
+			};
+			window.addEventListener('error', function (ev) {
+				xrlog('JS 에러: ' + ev.message + ' @ ' + (ev.filename || '?') + ':' + (ev.lineno || '?'), 'e');
+			});
+			window.addEventListener('unhandledrejection', function (ev) {
+				var r = ev.reason;
+				xrlog('처리안된 실패: ' + (r && r.message ? r.message : r), 'e');
+			});
+
+			xrlog('페이지 시작. ' + location.protocol + '//' + location.host);
+			if (location.protocol === 'file:') xrlog('file:// 로는 작동하지 않습니다. Live Server 로 여세요.', 'e');
+
+			if (!navigator.xr) {
+				xrlog('navigator.xr 없음 → WebXR 미지원. PC 에서는 정상입니다.', 'w');
+			} else {
+				navigator.xr.isSessionSupported('immersive-ar').then(function (ok) {
+					if (ok) xrlog('immersive-ar 지원됨 → START AR 버튼을 누르세요', 'ok');
+					else    xrlog('immersive-ar 미지원 (PC 라면 정상)', 'w');
+				}).catch(function (e) { xrlog('isSessionSupported 실패: ' + e.message, 'e'); });
+			}
+		})();
+		</script>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+					"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/",
+					"mindar-image": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three';
+			import { ARButton } from 'three/addons/webxr/ARButton.js';
+			import { Controller } from 'mindar-image';
+
+			xrlog( 'three.js 로드됨. REVISION = ' + THREE.REVISION, 'ok' );
+			xrlog( 'MindAR 코어 로드됨. Controller = ' + typeof Controller
+			     + ( window.MINDAR && window.MINDAR.IMAGE ? ' / window.MINDAR.IMAGE 있음' : '' ), 'ok' );
+
+			// ===================================================================
+			//  설정 — URL 파라미터로 조절 가능 (코드 수정 없이 현장 보정)
+			// ===================================================================
+			const Q = new URLSearchParams( location.search );
+			const MARKER_WIDTH_M  = parseFloat( Q.get( 'mw' ) )       || 0.10;   // 인쇄 마커 실제 가로폭(m)
+			const CAPTURE_SCALE   = parseFloat( Q.get( 'scale' ) )    || 1.0;    // 캡처 축소 배율
+			const DETECT_INTERVAL = parseInt(   Q.get( 'interval' ) ) || 400;    // detect 시도 간격(ms)
+			const USE_FOV_FIX     = Q.get( 'nofov' ) !== '1';                    // FOV 보정 사용
+
+			// MindAR 이 하드코딩한 fovy=45° 에 대응하는 GL proj[5] 값. 1/tan(22.5°)
+			const MINDAR_PROJ_11 = 1 / Math.tan( ( 45 * Math.PI / 180 ) / 2 );   // = 2.414213562
+
+			const TARGET_INDEX = 0;
+
+			xrlog( '설정 — 마커폭 ' + MARKER_WIDTH_M + 'm / 캡처배율 ' + CAPTURE_SCALE
+			     + ' / 간격 ' + DETECT_INTERVAL + 'ms / FOV보정 ' + ( USE_FOV_FIX ? 'ON' : 'OFF' )
+			     + ' / flip ' + ( Q.get( 'flip' ) !== null ? Q.get( 'flip' ) + '(고정)' : '자동' ) );
+			if ( ! Q.get( 'mw' ) ) {
+				xrlog( '⚠ 마커 실제 가로폭이 기본값 0.10m 입니다. 인쇄물을 자로 재서 '
+				     + '?mw=0.148 처럼 넘기세요. 이 값이 틀리면 anchor 거리가 틀어집니다.', 'w' );
+			}
+
+			let camera, scene, renderer;
+			let controllerInput;   // XR input source (탭 감지용 — 3단계에선 재시도 트리거)
+
+			// ── anchor 상태 (2단계에서 그대로) ──
+			const anchoredObjects = new Map();   // XRAnchor -> THREE.Object3D
+			let anchorCreated = false;
+
+			// ── MindAR 상태 ──
+			let mindarController = null;
+			let mindarReady = false;
+			let mindarBusy = false;
+			let mindarStopped = false;
+			let markerDims = null;        // [markerW, markerH] (픽셀)
+			let postMatrix = null;        // three.js 래퍼와 동일한 보정행렬
+			let detectAttempts = 0;
+			let lastDetectAt = 0;
+
+			// ── 캡처(blit) 상태 ──
+			let capW = 0, capH = 0;
+			let blitTarget = null, blitScene = null, blitCam = null, blitMesh = null;
+			let pixelBuf = null, capCanvas = null, capCtx = null, capImageData = null;
+			let blitFailed = false;
+			let loggedCapOnce = false;
+
+			// 캡처 상하 반전 방향. 틀리면 MindAR 이 절대 못 찾으므로 실패가 쌓이면 자동 토글한다.
+			// ?flip=0 / ?flip=1 로 고정 가능 (고정하면 자동 토글 안 함).
+			const FLIP_FORCED = Q.get( 'flip' ) !== null;
+			let flipRows = FLIP_FORCED ? ( Q.get( 'flip' ) === '1' ) : true;
+			const FLIP_SWITCH_AFTER = 12;   // 이 횟수만큼 실패하면 방향을 뒤집는다
+
+			const hudEl = document.getElementById( 'xrHud' );
+
+			init();
+
+			function init() {
+
+				const container = document.createElement( 'div' );
+				document.body.appendChild( container );
+
+				scene = new THREE.Scene();
+				camera = new THREE.PerspectiveCamera( 70, window.innerWidth / window.innerHeight, 0.01, 20 );
+
+				const light = new THREE.HemisphereLight( 0xffffff, 0xbbbbff, 3 );
+				light.position.set( 0.5, 1, 0.25 );
+				scene.add( light );
+
+				renderer = new THREE.WebGLRenderer( { antialias: true, alpha: true } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.setAnimationLoop( animate );
+				renderer.xr.enabled = true;
+				container.appendChild( renderer.domElement );
+
+				// 3단계는 camera-access 와 anchors 가 **둘 다 필수**다.
+				// (1·2단계에서 각각 부여됨을 이미 확인했으므로 required 로 둬도 안전)
+				document.body.appendChild( ARButton.createButton( renderer, {
+					requiredFeatures: [ 'camera-access', 'anchors' ],
+					optionalFeatures: [ 'dom-overlay' ],
+					domOverlay: { root: document.getElementById( 'xrOverlay' ) }
+				} ) );
+
+				document.getElementById( 'xrExit' ).addEventListener( 'click', () => {
+
+					const s = renderer.xr.getSession();
+					if ( s ) s.end();
+
+				} );
+
+				// 탭 = 인식 재시도 (anchor 를 이미 만들었으면 지우고 다시 찾는다)
+				controllerInput = renderer.xr.getController( 0 );
+				controllerInput.addEventListener( 'select', onSelect );
+				scene.add( controllerInput );
+
+				window.addEventListener( 'resize', onWindowResize );
+
+				const r = renderer.domElement.getBoundingClientRect();
+				xrlog( '캔버스 크기: ' + Math.round( r.width ) + ' x ' + Math.round( r.height )
+				     + ( r.height < 1 ? '  ← 높이 0!' : '  (정상)' ), r.height < 1 ? 'e' : '' );
+
+				renderer.xr.addEventListener( 'sessionstart', () => {
+
+					const s = renderer.xr.getSession();
+					const f = s.enabledFeatures;
+					xrlog( 'AR 세션 시작됨. enabledFeatures = ' + ( f ? JSON.stringify( f ) : '(미보고)' ), 'ok' );
+					if ( f && ! f.includes( 'camera-access' ) )
+						xrlog( '치명적: camera-access 가 없습니다. 3단계 불가', 'e' );
+					if ( f && ! f.includes( 'anchors' ) )
+						xrlog( '치명적: anchors 가 없습니다. 3단계 불가', 'e' );
+
+					detectAttempts = 0;
+					lastDetectAt = 0;
+					loggedCapOnce = false;
+
+				} );
+
+				renderer.xr.addEventListener( 'sessionend', () => {
+
+					xrlog( 'AR 세션 종료됨. detect 시도 ' + detectAttempts + '회, anchor '
+					     + anchoredObjects.size + '개. 위 로그를 확인하세요.' );
+
+				} );
+
+				xrlog( 'START AR 버튼 생성됨. 글자가 "AR NOT SUPPORTED" 면 폰에서 테스트하세요.' );
+
+			}
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			function onSelect() {
+
+				if ( ! anchorCreated ) {
+
+					xrlog( '탭 감지 — 아직 마커를 못 찾았습니다. 마커를 화면에 더 크게 담아보세요.', 'w' );
+					return;
+
+				}
+
+				// 재시도: 기존 anchor 삭제 후 MindAR 재가동
+				anchoredObjects.forEach( ( obj, anchor ) => {
+
+					scene.remove( obj );
+					try { anchor.delete(); } catch ( e ) { /* 이미 사라졌으면 무시 */ }
+
+				} );
+				anchoredObjects.clear();
+				anchorCreated = false;
+				mindarStopped = false;
+				detectAttempts = 0;
+				xrlog( '탭 — anchor 삭제하고 마커 재인식을 시작합니다.' );
+
+			}
+
+			// ===================================================================
+			//  [새로 작성 ①] WebGLTexture → 2D canvas blit
+			//
+			//  WebXR 의 카메라는 **opaque WebGLTexture** 로만 나오는데
+			//  MindAR 의 InputLoader 는 2D canvas 의 drawImage 를 요구한다
+			//  (input-loader.js: context.drawImage(input, ...)).
+			//  그래서 직접 읽어낼 수 없고 아래 경로를 쓴다:
+			//
+			//    카메라 텍스처 → (셰이더로 샘플링) → WebGLRenderTarget
+			//      → readRenderTargetPixels → Uint8Array → ImageData → 2D canvas
+			//
+			//  opaque 텍스처를 gl.readPixels 로 직접 읽는 건 스펙상 막힐 수 있으나,
+			//  **샘플링해서 우리 렌더타깃에 그리는 것은 허용**되므로 이 경로를 택했다.
+			//  readPixels 는 GPU→CPU 동기 복사라 느리다. 그래서
+			//    - 인식될 때까지만 호출하고
+			//    - DETECT_INTERVAL(기본 400ms) 로 throttle 하고
+			//    - 성공 후에는 아예 중단한다.
+			// ===================================================================
+			function setupBlit( texW, texH ) {
+
+				capW = Math.max( 1, Math.round( texW * CAPTURE_SCALE ) );
+				capH = Math.max( 1, Math.round( texH * CAPTURE_SCALE ) );
+
+				blitTarget = new THREE.WebGLRenderTarget( capW, capH, {
+					format: THREE.RGBAFormat,
+					type: THREE.UnsignedByteType,
+					depthBuffer: false,
+					stencilBuffer: false
+				} );
+
+				blitScene = new THREE.Scene();
+				blitCam = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
+				blitMesh = new THREE.Mesh(
+					new THREE.PlaneGeometry( 2, 2 ),
+					new THREE.MeshBasicMaterial()
+				);
+				blitScene.add( blitMesh );
+
+				pixelBuf = new Uint8Array( capW * capH * 4 );
+
+				capCanvas = document.createElement( 'canvas' );
+				capCanvas.width = capW;
+				capCanvas.height = capH;
+				capCtx = capCanvas.getContext( '2d', { willReadFrequently: false } );
+				capImageData = capCtx.createImageData( capW, capH );
+
+				xrlog( 'blit 준비 완료. 카메라 ' + texW + 'x' + texH
+				     + ' → 캡처 ' + capW + 'x' + capH
+				     + ' (' + ( capW * capH * 4 / 1048576 ).toFixed( 1 ) + 'MB/회)' );
+
+			}
+
+			// 카메라 텍스처를 2D canvas 로 옮긴다. 성공하면 capCanvas 반환, 실패면 null.
+			function captureFrame( cameraTexture ) {
+
+				const t0 = performance.now();
+
+				// three.js r186 소스에서 확인한 두 가지 함정을 여기서 처리한다.
+				//
+				//  ⚠️ 함정 1 — WebGLRenderer.render() 는 XR 세션 중이면 내 카메라를
+				//     **무조건 XR 카메라로 교체**한다:
+				//       if (xr.enabled && xr.isPresenting && ...) { camera = xr.getCamera(); }
+				//     그대로 두면 전체화면 쿼드가 AR 카메라 시점으로 그려져 쓰레기가 된다.
+				//     → blit 하는 동안만 xr.enabled 를 끈다 (세션은 그대로 유지된다).
+				//
+				//  ⚠️ 함정 2 — WebXRManager 는 **매 XR 프레임마다**
+				//       renderer.setRenderTarget(newRenderTarget)
+				//     로 XR 렌더타깃을 걸어둔다. 따라서 setRenderTarget(null) 로 복원하면
+				//     메인 렌더가 기본 프레임버퍼로 나가 **AR 화면이 안 보인다.**
+				//     → 반드시 getRenderTarget() 으로 받아둔 **직전 타깃**으로 복원한다.
+				const prevTarget = renderer.getRenderTarget();
+				const prevXrEnabled = renderer.xr.enabled;
+
+				try {
+
+					blitMesh.material.map = cameraTexture;
+					blitMesh.material.needsUpdate = true;
+
+					renderer.xr.enabled = false;              // 함정 1 회피
+					renderer.setRenderTarget( blitTarget );
+					renderer.render( blitScene, blitCam );
+					renderer.readRenderTargetPixels( blitTarget, 0, 0, capW, capH, pixelBuf );
+					renderer.setRenderTarget( prevTarget );   // 함정 2 회피
+					renderer.xr.enabled = prevXrEnabled;
+
+					// 상하 반전 처리.
+					//   WebGL readPixels 는 아래→위로 읽는다. 반면 카메라 텍스처 자체의
+					//   flipY 규약은 기기/구현에 따라 다를 수 있어 이중 반전이 될 수 있다.
+					//   틀린 방향이면 MindAR 이 절대 못 찾으므로, 실패가 쌓이면
+					//   자동으로 방향을 뒤집어 재시도한다 (flipRows 토글).
+					const dst = capImageData.data;
+					const rowBytes = capW * 4;
+
+					if ( flipRows ) {
+
+						for ( let y = 0; y < capH; y ++ ) {
+
+							const src = ( capH - 1 - y ) * rowBytes;
+							dst.set( pixelBuf.subarray( src, src + rowBytes ), y * rowBytes );
+
+						}
+
+					} else {
+
+						dst.set( pixelBuf );
+
+					}
+					capCtx.putImageData( capImageData, 0, 0 );
+
+					const ms = performance.now() - t0;
+					if ( ! loggedCapOnce ) {
+
+						loggedCapOnce = true;
+						xrlog( 'blit 성공 — ' + ms.toFixed( 1 ) + 'ms/회 (조사 때 최대 리스크였던 부분)', 'ok' );
+
+					}
+
+					return capCanvas;
+
+				} catch ( e ) {
+
+					// 실패해도 XR 상태는 반드시 되돌린다. 안 되돌리면 AR 화면이 죽는다.
+					try {
+
+						renderer.setRenderTarget( prevTarget );
+						renderer.xr.enabled = prevXrEnabled;
+
+					} catch ( e2 ) { /* noop */ }
+
+					if ( ! blitFailed ) {
+
+						blitFailed = true;
+						xrlog( 'blit 실패: ' + e.message + ' → 3단계 불가. 다른 경로 필요', 'e' );
+
+					}
+
+					return null;
+
+				}
+
+			}
+
+			// ===================================================================
+			//  [새로 작성 ②] MindAR Controller 직접 구동 (A-Frame 없이)
+			//  순서는 MindAR 의 three.js 래퍼와 동일: new → addImageTargets → dummyRun
+			// ===================================================================
+			async function setupMindAR() {
+
+				xrlog( 'MindAR Controller 생성 중 (input ' + capW + 'x' + capH + ')...' );
+
+				mindarController = new Controller( {
+					inputWidth: capW,
+					inputHeight: capH,
+					maxTrack: 1,
+					missTolerance: 0,
+					warmupTolerance: 0
+				} );
+
+				const t0 = performance.now();
+				const { dimensions } = await mindarController.addImageTargets( './targets.mind' );
+				xrlog( 'targets.mind 로드 성공 — 타깃 ' + dimensions.length + '개, 크기 '
+				     + JSON.stringify( dimensions ) + ' (' + ( performance.now() - t0 ).toFixed( 0 ) + 'ms)', 'ok' );
+
+				markerDims = dimensions[ TARGET_INDEX ];
+
+				// three.js 래퍼와 동일한 postMatrix (src/image-target/three.js)
+				const [ mw, mh ] = markerDims;
+				postMatrix = new THREE.Matrix4().compose(
+					new THREE.Vector3( mw / 2, mw / 2 + ( mh - mw ) / 2, 0 ),
+					new THREE.Quaternion(),
+					new THREE.Vector3( mw, mw, mw )
+				);
+
+				const t1 = performance.now();
+				await mindarController.dummyRun( capCanvas );   // tf 워밍업. 생략하면 첫 detect 가 매우 느리다
+				xrlog( 'dummyRun 완료 (' + ( performance.now() - t1 ).toFixed( 0 ) + 'ms) — 인식 시작', 'ok' );
+
+				mindarReady = true;
+
+			}
+
+			// 1회 인식 시도
+			async function tryDetect( canvasInput, frame, view, referenceSpace ) {
+
+				mindarBusy = true;
+				detectAttempts ++;
+
+				try {
+
+					const t0 = performance.now();
+					const { featurePoints } = await mindarController.detect( canvasInput );
+					const { modelViewTransform } = await mindarController.match( featurePoints, TARGET_INDEX );
+					const ms = performance.now() - t0;
+
+					if ( ! modelViewTransform ) {
+
+						if ( detectAttempts % 5 === 1 ) {
+
+							xrlog( 'detect #' + detectAttempts + ': 못 찾음 (특징점 '
+							     + ( featurePoints ? featurePoints.length : 0 ) + '개, ' + ms.toFixed( 0 ) + 'ms, flip='
+							     + ( flipRows ? 1 : 0 ) + ')' );
+
+						}
+
+						// 상하 반전 방향이 틀렸을 가능성 — 일정 횟수 실패하면 자동으로 뒤집는다.
+						// 특징점이 충분히 나오는데도 매칭이 안 되는 상황이 전형적인 증상이다.
+						if ( ! FLIP_FORCED && detectAttempts > 0 && detectAttempts % FLIP_SWITCH_AFTER === 0 ) {
+
+							flipRows = ! flipRows;
+							xrlog( detectAttempts + '회 실패 — 캡처 상하 방향을 flip=' + ( flipRows ? 1 : 0 )
+							     + ' 로 바꿔 재시도합니다', 'w' );
+
+						}
+
+						return;
+
+					}
+
+					xrlog( '✓ 마커 인식 성공! detect #' + detectAttempts + ' (' + ms.toFixed( 0 ) + 'ms)', 'ok' );
+
+					const worldMatrix = mindarController.getWorldMatrix( modelViewTransform, TARGET_INDEX );
+					onMarkerFound( worldMatrix, frame, view, referenceSpace );
+
+				} catch ( e ) {
+
+					xrlog( 'detect/match 중 에러: ' + e.message, 'e' );
+
+				} finally {
+
+					mindarBusy = false;
+
+				}
+
+			}
+
+			// ===================================================================
+			//  [새로 작성 ③] MindAR 포즈 → WebXR 기준공간 변환 + FOV 보정
+			//
+			//  1) M_cam_marker = Matrix4(worldMatrix) × postMatrix       (MindAR 규약)
+			//     → 카메라(view) 공간. 그룹 로컬에서 마커 가로폭 = 1 단위.
+			//
+			//  2) 단위 환산:  MindAR 단위 → 미터
+			//       1 MindAR 단위(= markerW 픽셀) = MARKER_WIDTH_M / markerW  미터
+			//
+			//  3) FOV 보정:  MindAR 은 fovy=45° 를 가정하므로 거리가 틀어진다.
+			//       Z_실제 = Z_MindAR × (f_실제 / f_가정)
+			//              = Z_MindAR × (view.projectionMatrix[5] / 2.41421)
+			//     회전은 보정하지 않는다 (영향이 훨씬 작고, 보정식이 단순하지 않음).
+			//
+			//  4) 기준공간으로:  M_ref_marker = view.transform.matrix × M_cam_marker(미터)
+			//     XRView.transform 은 view→refSpace 변환이다.
+			//
+			//  5) anchor 는 위치+회전만 받는다(XRRigidTransform 에 스케일 없음).
+			//     스케일은 콘텐츠에 따로 적용한다: 1 그룹단위 = MARKER_WIDTH_M 미터.
+			// ===================================================================
+			function onMarkerFound( worldMatrix, frame, view, referenceSpace ) {
+
+				// 1) MindAR 규약대로 조립
+				const mCamMarker = new THREE.Matrix4();
+				mCamMarker.elements = [ ...worldMatrix ];
+				mCamMarker.multiply( postMatrix );
+
+				const pos = new THREE.Vector3();
+				const quat = new THREE.Quaternion();
+				const scl = new THREE.Vector3();
+				mCamMarker.decompose( pos, quat, scl );
+
+				// 2) 단위 환산 + 3) FOV 보정
+				const markerWpx = markerDims[ 0 ];
+				const unitToM = MARKER_WIDTH_M / markerWpx;
+
+				const projReal = view.projectionMatrix[ 5 ];
+				const fovFix = USE_FOV_FIX ? ( projReal / MINDAR_PROJ_11 ) : 1;
+
+				const vfovReal = 2 * Math.atan( 1 / projReal ) * 180 / Math.PI;
+				xrlog( 'FOV — 실제 수직 ' + vfovReal.toFixed( 1 ) + '° (proj[5]=' + projReal.toFixed( 3 ) + ')'
+				     + ' vs MindAR 가정 45.0° → 보정계수 ' + fovFix.toFixed( 3 )
+				     + ( USE_FOV_FIX ? '' : ' (보정 OFF)' ) );
+
+				const distRaw = pos.length() * unitToM;
+				pos.multiplyScalar( unitToM * fovFix );
+				const distFixed = pos.length();
+
+				xrlog( '마커 거리 — 보정전 ' + distRaw.toFixed( 3 ) + 'm → 보정후 '
+				     + distFixed.toFixed( 3 ) + 'm  (자로 재서 어느 쪽이 맞는지 알려주세요)', 'ok' );
+
+				// 4) 기준공간으로 변환
+				const mCamMarkerMetric = new THREE.Matrix4().compose( pos, quat, new THREE.Vector3( 1, 1, 1 ) );
+				const mRefCam = new THREE.Matrix4().fromArray( view.transform.matrix );
+				const mRefMarker = new THREE.Matrix4().multiplyMatrices( mRefCam, mCamMarkerMetric );
+
+				const rPos = new THREE.Vector3();
+				const rQuat = new THREE.Quaternion();
+				mRefMarker.decompose( rPos, rQuat, new THREE.Vector3() );
+
+				xrlog( '기준공간 마커 위치 = ('
+				     + rPos.x.toFixed( 3 ) + ', ' + rPos.y.toFixed( 3 ) + ', ' + rPos.z.toFixed( 3 ) + ')' );
+
+				// 5) anchor 생성
+				if ( typeof frame.createAnchor !== 'function' ) {
+
+					xrlog( 'frame.createAnchor 없음 → anchor 생성 불가', 'e' );
+					return;
+
+				}
+
+				let xform;
+				try {
+
+					xform = new XRRigidTransform(
+						{ x: rPos.x, y: rPos.y, z: rPos.z, w: 1 },
+						{ x: rQuat.x, y: rQuat.y, z: rQuat.z, w: rQuat.w }
+					);
+
+				} catch ( e ) {
+
+					xrlog( 'XRRigidTransform 생성 실패: ' + e.message, 'e' );
+					return;
+
+				}
+
+				anchorCreated = true;   // 중복 생성 방지를 먼저 걸어둔다 (createAnchor 는 비동기)
+
+				frame.createAnchor( xform, referenceSpace ).then(
+					anchor => {
+
+						const group = buildMarkerContent();
+						group.matrixAutoUpdate = false;
+						scene.add( group );
+						anchoredObjects.set( anchor, group );
+
+						xrlog( 'anchor 생성 성공 — 이제 마커를 치워도/화면에서 벗어나도 유지됩니다', 'ok' );
+
+						stopMindAR();
+
+					},
+					err => {
+
+						anchorCreated = false;
+						xrlog( 'createAnchor 실패: ' + err.message, 'e' );
+
+					}
+				);
+
+			}
+
+			// 마커 위에 올릴 콘텐츠.
+			// 1 단위 = 마커 가로폭 = MARKER_WIDTH_M 미터 로 스케일을 걸어두면
+			// 4단계에서 mep_test.glb 를 **기존 기본값 그대로** 얹을 수 있다.
+			function buildMarkerContent() {
+
+				const group = new THREE.Group();
+				group.scale.setScalar( MARKER_WIDTH_M );
+
+				const mh = markerDims[ 1 ] / markerDims[ 0 ];   // 세로/가로 비
+
+				// ① 마커 외곽선 — 인쇄물 테두리와 겹쳐 보이면 포즈가 맞는다는 뜻 (정확도 육안 검증용)
+				const hw = 0.5, hh = mh / 2;
+				const outline = new THREE.LineSegments(
+					new THREE.BufferGeometry().setAttribute( 'position', new THREE.Float32BufferAttribute( [
+						-hw, -hh, 0,   hw, -hh, 0,
+						 hw, -hh, 0,   hw,  hh, 0,
+						 hw,  hh, 0,  -hw,  hh, 0,
+						-hw,  hh, 0,  -hw, -hh, 0
+					], 3 ) ),
+					new THREE.LineBasicMaterial( { color: 0x00ff66 } )
+				);
+				group.add( outline );
+
+				// ② 축 표시 — X 빨강 / Y 초록 / Z 파랑(마커에서 위로)
+				group.add( new THREE.AxesHelper( 0.5 ) );
+
+				// ③ 작은 큐브 — 멀리서도 보이게
+				const cube = new THREE.Mesh(
+					new THREE.BoxGeometry( 0.25, 0.25, 0.25 ).translate( 0, 0, 0.125 ),
+					new THREE.MeshPhongMaterial( { color: 0x00ff66 } )
+				);
+				group.add( cube );
+
+				return group;
+
+			}
+
+			function stopMindAR() {
+
+				if ( mindarStopped ) return;
+				mindarStopped = true;
+
+				// 성능 확보: 인식은 1회만 필요하므로 tfjs 를 더 돌리지 않는다.
+				// (조사 때 짚은 핵심 설계 포인트)
+				try {
+
+					mindarController.dispose();
+					xrlog( 'MindAR 중단 (dispose). 이후 추적은 ARCore anchor 가 담당', 'ok' );
+
+				} catch ( e ) {
+
+					xrlog( 'MindAR dispose 경고: ' + e.message + ' (detect 호출은 이미 중단됨)', 'w' );
+
+				}
+
+			}
+
+			// ── [2단계에서 그대로] anchor 포즈 갱신 ──
+			function updateAnchors( frame, referenceSpace, viewerPos ) {
+
+				if ( anchoredObjects.size === 0 ) return null;
+
+				const tracked = frame.trackedAnchors;
+				let lost = 0;
+				let nearest = Infinity;
+
+				anchoredObjects.forEach( ( obj, anchor ) => {
+
+					if ( tracked && ! tracked.has( anchor ) ) {
+
+						if ( obj.visible ) {
+
+							obj.visible = false;
+							xrlog( 'anchor 추적 상실', 'w' );
+
+						}
+						lost ++;
+						return;
+
+					}
+
+					const pose = frame.getPose( anchor.anchorSpace, referenceSpace );
+					if ( ! pose ) { lost ++; return; }
+
+					if ( ! obj.visible ) {
+
+						obj.visible = true;
+						xrlog( 'anchor 추적 복귀', 'ok' );
+
+					}
+
+					// 스케일은 group 에 걸려 있으므로 matrix 를 직접 쓰면 덮어써진다.
+					// → 포즈 행렬에 스케일을 다시 곱해서 넣는다.
+					obj.matrix.fromArray( pose.transform.matrix );
+					obj.matrix.scale( new THREE.Vector3( MARKER_WIDTH_M, MARKER_WIDTH_M, MARKER_WIDTH_M ) );
+
+					if ( viewerPos ) {
+
+						const p = pose.transform.position;
+						const d = Math.hypot( p.x - viewerPos.x, p.y - viewerPos.y, p.z - viewerPos.z );
+						if ( d < nearest ) nearest = d;
+
+					}
+
+				} );
+
+				return { lost, nearest };
+
+			}
+
+			//
+
+			function animate( timestamp, frame ) {
+
+				if ( frame ) {
+
+					const referenceSpace = renderer.xr.getReferenceSpace();
+					const viewerPose = frame.getViewerPose( referenceSpace );
+
+					if ( viewerPose ) {
+
+						const view = viewerPose.views.find( v => v.camera );
+
+						// ── 인식 단계 ──
+						if ( view && ! anchorCreated && ! blitFailed ) {
+
+							let cameraTexture = null;
+							try {
+
+								cameraTexture = renderer.xr.getCameraTexture( view.camera );
+
+							} catch ( e ) {
+
+								if ( ! blitFailed ) {
+
+									blitFailed = true;
+									xrlog( 'getCameraTexture 실패: ' + e.message, 'e' );
+
+								}
+
+							}
+
+							if ( cameraTexture ) {
+
+								if ( ! blitTarget ) setupBlit( view.camera.width, view.camera.height );
+
+								// MindAR 초기화는 캡처 크기를 알아야 가능하므로 blit 준비 후에 1회만
+								if ( ! mindarController ) {
+
+									setupMindAR().catch( e => {
+
+										xrlog( 'MindAR 초기화 실패: ' + e.message, 'e' );
+										blitFailed = true;   // 더 시도하지 않는다
+
+									} );
+
+								}
+
+								if ( mindarReady && ! mindarBusy && ! mindarStopped
+								     && timestamp - lastDetectAt > DETECT_INTERVAL ) {
+
+									lastDetectAt = timestamp;
+									const canvasInput = captureFrame( cameraTexture );
+
+									if ( canvasInput ) {
+
+										// await 하지 않는다 — 렌더 루프를 막으면 안 된다.
+										tryDetect( canvasInput, frame, view, referenceSpace );
+
+									}
+
+								}
+
+							}
+
+						}
+
+						// ── 유지 단계 ──
+						const viewerPos = viewerPose.transform.position;
+						const st = updateAnchors( frame, referenceSpace, viewerPos );
+						updateHud( st );
+
+					}
+
+				}
+
+				renderer.render( scene, camera );
+
+			}
+
+			function updateHud( st ) {
+
+				if ( ! hudEl ) return;
+
+				if ( ! anchorCreated ) {
+
+					if ( blitFailed )      hudEl.innerHTML = '<span class="warn">카메라 캡처 실패 — ✕ 로 종료하고 로그를 확인하세요</span>';
+					else if ( ! mindarReady ) hudEl.innerHTML = 'MindAR 준비 중... (targets.mind 로드 + tf 워밍업)';
+					else                   hudEl.innerHTML = '마커를 비춰주세요\n<span class="d">시도 ' + detectAttempts + '회</span>';
+					return;
+
+				}
+
+				let line = '<span class="good">✓ 마커 인식됨 — anchor 생성 완료</span>\n';
+
+				if ( st ) {
+
+					const dist = isFinite( st.nearest ) ? st.nearest.toFixed( 2 ) + 'm' : '—';
+					line += '거리 <span class="d">' + dist + '</span>   ';
+					line += st.lost > 0
+						? '<span class="warn">추적 상실</span>'
+						: '추적 정상 — 걸어가도 유지됩니다';
+
+				}
+
+				hudEl.innerHTML = line;
+
+			}
+
+		</script>
+	</body>
+</html>

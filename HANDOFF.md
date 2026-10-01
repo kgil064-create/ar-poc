@@ -280,9 +280,18 @@ M_카메라_마커 = Matrix4(controller.getWorldMatrix(mvt, idx)) × postMatrix
 - **그룹 로컬 공간에서 마커 가로폭 = 1 단위** ← `ar.html` 의 `FIT_MARKER_SPAN=7.24` 전제와 동일
 - 따라서 미터로 바꾸려면 **인쇄된 마커의 실제 가로폭(m)** 이 필요하다
 
-> **🔴 3단계에 반드시 필요한 입력값: 인쇄된 `marker.png` 의 실제 가로폭(미터).**
-> 이 값이 틀리면 anchor 가 엉뚱한 거리에 생긴다. `xr-test-3.html` 은 URL 파라미터
-> `?mw=0.148` 로 조절 가능하게 만들어 뒀다 (기본값 0.10m).
+### ✅ 인쇄 마커 실측값 (확정, 2026-10-01)
+
+```
+가로 18 cm × 세로 10 cm   →  xr-test-3.html 접속 시  ?mw=0.18
+```
+
+**교차검증 통과**: `test-official.html` 의 공식 카드 비율은 `width="1" height="0.552"` 이고
+`18 cm × 0.552 = 9.94 cm ≈ 10 cm` 로 실측과 일치한다. 즉 인쇄물이 원본 비율대로
+출력되었음이 확인됐다 (찌그러진 인쇄가 아님).
+
+> 이 값이 틀리면 anchor 가 엉뚱한 거리에 생긴다. 마커를 **다시 인쇄하면 반드시 재실측**할 것.
+> `xr-test-3.html` 은 URL 파라미터로 받으므로 코드 수정 없이 바꿀 수 있다 (기본값 0.10m).
 
 ---
 
@@ -316,7 +325,8 @@ M_카메라_마커 = Matrix4(controller.getWorldMatrix(mvt, idx)) × postMatrix
 | `index.html` | 428 B | model-viewer 3D 뷰어 (AR 아님) | 정상 작동. 백업용 유지. 커밋됨 |
 | `test-official.html` | 4.6 KB | MindAR 공식 예제 복제 — **대조군** | 정상 작동. 커밋됨. **보존할 것** (회귀 판별용) |
 | `xr-test.html` | 11.2 KB | WebXR **1단계** (camera-access) — **대조군** | ✅ **로컬·폰 통과.** 커밋됨 (`e95f43b`). **보존할 것** |
-| `xr-test-2.html` | 19.6 KB | WebXR **2단계** (hit-test + anchors) | 작성 완료, **검증 대기.** 미커밋 |
+| `xr-test-2.html` | 19.6 KB | WebXR **2단계** (hit-test + anchors) — **대조군** | ✅ **폰 통과** (anchor 1개 시나리오). 커밋됨 (`6296938`) |
+| `xr-test-3.html` | 32.9 KB | WebXR **3단계** (MindAR 인식 + anchor 결합) | PC 로컬 통과. **폰 검증 대기** |
 | `mep_test.glb` | 7.51 MB | Revit 변환 배관 모델 | 커밋됨. **AR에서 검증 완료** |
 | `targets.mind` | 256 KB | `marker.png` 학습 파일 | 커밋됨. **AR에서 검증 완료** |
 | `marker.png` | 61.7 KB | 마커 이미지 (= 공식 card.png) | 커밋됨. 인쇄본 보유 |
