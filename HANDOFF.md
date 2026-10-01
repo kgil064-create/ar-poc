@@ -194,6 +194,96 @@ getWorldMatrix(modelViewTransform, targetIndex) // 포즈 행렬 반환
 적혀 있다. 폰 통과는 그 커밋 **이후**에 확인됐고, 메시지를 번복하지 않기로 해
 **이 문서가 폰 통과의 기록**이다.
 
+### ✅ 2단계 완료 — `xr-test-2.html` (2026-10-01)
+
+**테스트 환경**: 갤럭시 S24 울트라 / 복도 / **광택 타일 + 유리벽** (ARCore에 불리한 조건)
+
+```
+enabledFeatures = ["local","camera-access","viewer","hit-test","dom-overlay","anchors"]
+```
+
+| 확인 사항 | 결과 |
+|---|---|
+| **요청한 feature 전부 승인** (`anchors`, `hit-test` 포함) | ✅ |
+| `hit.createAnchor()` 1순위 경로 성공 | ✅ (폴백 불필요) |
+| **실사용 시나리오 — anchor 1개 + 걸어갔다 돌아오기** | ✅ **거의 제자리. 드리프트 수용 가능** |
+| 스트레스 테스트 — anchor 11개 | ⚠️ `trackedAnchors` 상실 관찰 |
+
+**사용자 판정: 통과.** 11개 상실은 **환경(광택 타일·유리벽) + anchor 과다 생성의 복합 원인**으로
+판단했다. 실제 설계는 **anchor 1개**(마커 1개 → anchor 1개)이므로 해당 시나리오에서
+작동함이 확인된 것으로 충분하다.
+
+> **교훈으로 남길 것**: 광택 바닥·유리벽은 ARCore에 불리하다. 현장 테스트 장소 선정 시
+> 바닥 무늬가 있고 반사면이 적은 곳을 고를 것. anchor 개수는 **최소로 유지**한다.
+
+### 조사 단계의 미해결 리스크 — 전부 해소됨
+
+| 조사 때 "확인 불가"였던 항목 | 결과 |
+|---|---|
+| S24 Ultra에서 `anchors` 실제 동작 | ✅ 확인 (2단계) |
+| WebGLTexture 획득 가능 여부 | ✅ 확인 (1단계, 886×1920) |
+| 공간 추적이 쓸 만한 수준인지 | ✅ 확인 (anchor 1개 시나리오) |
+
+---
+
+## 4-A. 3단계 착수 전 확인한 기술 사실 (2026-10-01)
+
+MindAR 소스를 직접 읽어 확인한 것. **다음 세션에서 재조사하지 말 것.**
+
+### `mindar-image.prod.js` 는 ES 모듈이다 (266 bytes 짜리 shim)
+
+```js
+// mindar-image.prod.js 전문 — 형제 청크를 import 하는 ES 모듈
+import { C as o, a as r } from "./controller-mGt1s8dJ.js";   // 2.2 MB (tfjs 포함)
+import { U as i } from "./ui-fBadYuor.js";
+window.MINDAR.IMAGE = { Controller: o, Compiler: r, UI: i };
+export { r as Compiler, o as Controller, i as UI };
+```
+
+- **일반 `<script>` 로는 로드 불가.** `<script type="module">` 또는 importmap 필요.
+- 청크 경로가 상대경로라 **CDN 절대경로로 로드하면 자동 해결**된다.
+- **Web Worker 는 base64 → Blob → `createObjectURL` 로 인라인**되어 있고
+  실패 시 `data:` URL 폴백까지 있다. → **CDN 로드에서 깨지지 않는다.**
+- tfjs 가 번들에 포함되어 있어 별도 로드 불필요.
+
+### 🔴 MindAR 은 카메라 FOV 를 45° 로 **하드코딩**한다
+
+`src/image-target/controller.js:36-47`:
+```js
+const fovy = 45.0 * Math.PI / 180;            // ← 하드코딩
+const f = (this.inputHeight/2) / Math.tan(fovy/2);
+this.projectionTransform = [[f,0,W/2],[0,f,H/2],[0,0,1]];
+```
+
+핀홀 모델에서 추정 거리는 `Z = f × S / s(픽셀)` 이므로,
+**가정한 f 가 틀리면 거리가 그 비율만큼 틀어진다**:
+
+```
+Z_실제 = Z_MindAR × (f_실제 / f_가정)
+f_가정 에 해당하는 proj[5] = 1/tan(22.5°) = 2.41421
+f_실제 에 해당하는 proj[5] = view.projectionMatrix[5]  (WebXR 이 알려줌)
+→ 보정계수 = view.projectionMatrix[5] / 2.41421
+```
+
+A-Frame 환경에서는 `MindARThree.resize()` 가 **카메라 FOV 를 MindAR 쪽에 맞춰
+역산**해서 쓰기 때문에 이 오차가 드러나지 않았다. WebXR 은 카메라 투영을 우리가
+고칠 수 없으므로 **반대로 포즈를 보정해야 한다.**
+
+### MindAR 포즈의 단위와 좌표계
+
+`src/image-target/three.js` 가 쓰는 변환 그대로:
+```js
+M_카메라_마커 = Matrix4(controller.getWorldMatrix(mvt, idx)) × postMatrix
+// postMatrix: position(markerW/2, markerW/2+(markerH-markerW)/2, 0), scale(markerW,markerW,markerW)
+```
+- 결과는 **카메라(view) 공간** 기준, three.js/GL 규약(오른손, -Z 전방)
+- **그룹 로컬 공간에서 마커 가로폭 = 1 단위** ← `ar.html` 의 `FIT_MARKER_SPAN=7.24` 전제와 동일
+- 따라서 미터로 바꾸려면 **인쇄된 마커의 실제 가로폭(m)** 이 필요하다
+
+> **🔴 3단계에 반드시 필요한 입력값: 인쇄된 `marker.png` 의 실제 가로폭(미터).**
+> 이 값이 틀리면 anchor 가 엉뚱한 거리에 생긴다. `xr-test-3.html` 은 URL 파라미터
+> `?mw=0.148` 로 조절 가능하게 만들어 뒀다 (기본값 0.10m).
+
 ---
 
 ## 5. 그 외 백로그 (우선순위 낮음)
