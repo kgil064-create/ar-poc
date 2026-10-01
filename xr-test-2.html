@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="ko">
+<!--
+  xr-test-2.html — 역방향 증분 2단계: hit-test + anchors
+
+  목적:
+    "탭한 지점에 큐브를 anchor 로 고정 → 폰을 들고 걸어갔다 돌아와도 제자리에 있는가"
+    를 **마커 없이** 증명한다. 즉 ARCore 공간 추적 자체가 쓸 만한지 먼저 가린다.
+    여기까지 통과하면 옵션 B(WebXR)가 확정된다.
+
+  ───────────────────────────────────────────────────────────────────────
+  출처 / 작성 구분
+
+   [공식 그대로]  레티클 + hit-test 패턴
+     https://github.com/mrdoob/three.js/blob/r186/examples/webxr_ar_hittest.html
+     - reticle 메시 (RingGeometry 0.15/0.2, rotateX(-PI/2), matrixAutoUpdate=false)
+     - session.requestReferenceSpace('viewer') → session.requestHitTestSource({space})
+     - frame.getHitTestResults(hitTestSource) → hit.getPose(referenceSpace)
+     - renderer.xr.getController(0/1) 의 'select' 이벤트로 탭 감지
+
+   [직접 작성]  anchor 부분 (three.js 에 공식 anchors 예제가 없음 — 404 확인)
+     WebXR Anchors Module 스펙 기준: https://immersive-web.github.io/anchors/
+     - XRHitTestResult.createAnchor()           ← 1순위. 실제 평면(trackable)에 부착됨
+     - XRFrame.createAnchor(pose, space)        ← 2순위 폴백. free-floating
+     - XRFrame.trackedAnchors (XRAnchorSet)     ← 추적 상실 감지
+     - XRFrame.getPose(anchor.anchorSpace, refSpace) ← 매 프레임 포즈 갱신 = "제자리" 핵심
+
+   [추가]  진단 로그창 + 세션 중 HUD (아래 '의도적 변경' 참조)
+  ───────────────────────────────────────────────────────────────────────
+  의도적 변경 3가지 — 판단 근거를 남긴다
+
+   1) camera-access 를 requiredFeatures → optionalFeatures 로 옮겼다.
+      2단계가 증명할 것은 hit-test + anchors 다. 카메라 텍스처는 1단계에서 이미
+      증명됐고(886×1920 획득) 2단계 목표와 무관하다. required 로 두면 쓰지도 않는
+      기능 때문에 세션 전체가 실패할 수 있으므로 실패면을 줄였다.
+      실제로 부여됐는지는 세션 시작 로그의 enabledFeatures 로 확인된다.
+
+   2) domOverlay 를 우리 것으로 지정했다 (1단계에서는 공식 그대로 뒀음).
+      근거: 1단계 결과 enabledFeatures 에 dom-overlay 가 실제로 포함되어
+      검증된 기능이 되었다. 2단계는 "걸어갔다 돌아와도 제자리인가"를 보는 것이고,
+      이는 눈대중으로 판정이 어렵다 → 세션 중 실시간 거리 숫자가 꼭 필요하다.
+      (PoC 합격선이 ±15cm 이므로 눈대중으로는 판정 불가)
+      ※ domOverlay 를 직접 넘기면 ARButton 이 자기 X 버튼을 안 만든다.
+        그래서 아래 #xrExit 버튼을 직접 넣었다. 혹시 안 먹으면 **시스템 뒤로가기**로 나올 수 있다.
+
+   3) 큐브는 회전시키지 않는다. 고정된 물체로 보여야 판정이 쉽다.
+  ───────────────────────────────────────────────────────────────────────
+-->
+	<head>
+		<title>xr-test 2단계 — anchor + hit-test</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
+		<style>
+			* { box-sizing: border-box; }
+			body {
+				margin: 0; overflow: hidden; background: #000; color: #fff;
+				font-family: -apple-system, "Malgun Gothic", monospace, sans-serif;
+			}
+			#info {
+				position: absolute; top: 0; width: 100%; padding: 10px;
+				text-align: center; pointer-events: none; z-index: 1;
+				font-size: 13px; line-height: 1.5; user-select: none;
+			}
+
+			/* 진단 로그창 — 세션 시작 전 / 종료 후에 보인다 */
+			#logbox {
+				position: fixed; left: 8px; right: 8px; bottom: 8px; z-index: 40;
+				max-height: 55vh; overflow-y: auto;
+				background: rgba(0,0,0,.92); color: #b6ffb6; border: 1px solid #0a0;
+				border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px;
+				line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+			}
+			#logbox .e  { color: #ff8080; font-weight: bold; }
+			#logbox .w  { color: #ffd280; }
+			#logbox .ok { color: #7fff7f; font-weight: bold; }
+
+			/* ── 세션 중 HUD (dom-overlay 안에 들어감) ── */
+			#xrHud {
+				position: absolute; top: 0; left: 0; right: 0;
+				background: rgba(0,0,0,.72); color: #fff;
+				padding: 12px 56px 12px 12px;
+				font-family: monospace; font-size: 15px; font-weight: 700;
+				line-height: 1.45; white-space: pre-line;
+			}
+			#xrHud .d { color: #7fdcff; }
+			#xrHud .warn { color: #ffb0b0; }
+			#xrExit {
+				position: absolute; top: 10px; right: 10px;
+				width: 38px; height: 38px; border-radius: 19px;
+				background: rgba(0,0,0,.6); color: #fff;
+				border: 2px solid #fff; font-size: 18px; font-weight: bold;
+				line-height: 1; padding: 0;
+			}
+		</style>
+	</head>
+	<body>
+
+		<div id="info">
+			2단계 검증: hit-test + anchors<br/>
+			<small>바닥을 겨눠 레티클이 뜨면 화면을 탭하세요</small>
+		</div>
+
+		<div id="logbox"></div>
+
+		<!-- 세션 중에만 보이는 오버레이. ARButton 이 display 를 켜고 끈다. -->
+		<div id="xrOverlay" style="display:none">
+			<div id="xrHud">초기화 중...</div>
+			<button id="xrExit" title="AR 종료">✕</button>
+		</div>
+
+		<!-- ================= [진단] 화면 내 로그 ================= -->
+		<script>
+		(function () {
+			'use strict';
+			var logbox = document.getElementById('logbox');
+			var n = 0;
+			window.xrlog = function (msg, kind) {
+				n++;
+				var d = document.createElement('div');
+				if (kind) d.className = kind;
+				d.textContent = '[' + n + '] ' + msg;
+				logbox.appendChild(d);
+				logbox.scrollTop = logbox.scrollHeight;
+			};
+			window.addEventListener('error', function (ev) {
+				xrlog('JS 에러: ' + ev.message + ' @ ' + (ev.filename || '?') + ':' + (ev.lineno || '?'), 'e');
+			});
+			window.addEventListener('unhandledrejection', function (ev) {
+				var r = ev.reason;
+				xrlog('처리안된 실패: ' + (r && r.message ? r.message : r), 'e');
+			});
+
+			xrlog('페이지 시작. ' + location.protocol + '//' + location.host);
+			if (location.protocol === 'file:') xrlog('file:// 로는 작동하지 않습니다. Live Server 로 여세요.', 'e');
+
+			if (!navigator.xr) {
+				xrlog('navigator.xr 없음 → WebXR 미지원. PC 에서는 정상입니다.', 'w');
+			} else {
+				xrlog('navigator.xr 있음');
+				navigator.xr.isSessionSupported('immersive-ar').then(function (ok) {
+					if (ok) xrlog('immersive-ar 지원됨 → START AR 버튼을 누르세요', 'ok');
+					else    xrlog('immersive-ar 미지원 (PC 라면 정상)', 'w');
+				}).catch(function (e) { xrlog('isSessionSupported 실패: ' + e.message, 'e'); });
+			}
+
+			// 2단계에서 새로 쓰는 API 가 이 브라우저에 존재하는지 (세션 없이도 확인 가능)
+			var hasAnchorAPI = (typeof XRFrame !== 'undefined')
+			                && (XRFrame.prototype.createAnchor !== undefined);
+			var hasHitAnchor = (typeof XRHitTestResult !== 'undefined')
+			                && (XRHitTestResult.prototype.createAnchor !== undefined);
+			xrlog('API 확인 — XRFrame.createAnchor: ' + (hasAnchorAPI ? '있음' : '없음')
+			    + ' / XRHitTestResult.createAnchor: ' + (hasHitAnchor ? '있음' : '없음'),
+			    (hasAnchorAPI || hasHitAnchor) ? 'ok' : 'w');
+		})();
+		</script>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+					"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+				}
+			}
+		</script>
+
+		<script type="module">
+
+			import * as THREE from 'three';
+			import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+			xrlog( 'three.js 로드됨. REVISION = ' + THREE.REVISION, 'ok' );
+
+			let container;
+			let camera, scene, renderer;
+			let controller1, controller2;
+			let reticle;
+
+			let hitTestSource = null;
+			let hitTestSourceRequested = false;
+
+			// ── [직접 작성] anchor 상태 ──
+			const anchoredObjects = new Map();   // XRAnchor -> THREE.Mesh
+			let anchorRequested = false;         // 탭이 들어왔음을 animate 로 전달하는 플래그
+			let anchorSeq = 0;
+			let reticleEverSeen = false;
+			let distSamples = 0;
+			let lastDistLogAt = 0;
+
+			const hudEl = document.getElementById( 'xrHud' );
+
+			init();
+
+			function init() {
+
+				container = document.createElement( 'div' );
+				document.body.appendChild( container );
+
+				scene = new THREE.Scene();
+
+				camera = new THREE.PerspectiveCamera( 70, window.innerWidth / window.innerHeight, 0.01, 20 );
+
+				const light = new THREE.HemisphereLight( 0xffffff, 0xbbbbff, 3 );
+				light.position.set( 0.5, 1, 0.25 );
+				scene.add( light );
+
+				//
+
+				renderer = new THREE.WebGLRenderer( { antialias: true, alpha: true } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.setAnimationLoop( animate );
+				renderer.xr.enabled = true;
+				container.appendChild( renderer.domElement );
+
+				//
+
+				// [변경] hit-test + anchors 를 required, camera-access 는 optional (위 주석 1번 참조)
+				document.body.appendChild( ARButton.createButton( renderer, {
+					requiredFeatures: [ 'hit-test', 'anchors' ],
+					optionalFeatures: [ 'camera-access', 'dom-overlay' ],
+					domOverlay: { root: document.getElementById( 'xrOverlay' ) }
+				} ) );
+
+				document.getElementById( 'xrExit' ).addEventListener( 'click', () => {
+
+					const s = renderer.xr.getSession();
+					if ( s ) s.end();
+
+				} );
+
+				// ── [공식 그대로] 탭 → 레티클 위치에 배치 ──
+				function onSelect() {
+
+					if ( reticle.visible ) {
+
+						anchorRequested = true;   // [변경] 즉시 생성하지 않는다. 이유는 placeAnchor 주석 참조
+
+					} else {
+
+						xrlog( '탭 감지됐지만 레티클이 없어 무시됨 (바닥을 더 겨눠보세요)', 'w' );
+
+					}
+
+				}
+
+				controller1 = renderer.xr.getController( 0 );
+				controller1.addEventListener( 'select', onSelect );
+				scene.add( controller1 );
+
+				controller2 = renderer.xr.getController( 1 );
+				controller2.addEventListener( 'select', onSelect );
+				scene.add( controller2 );
+
+				// ── [공식 그대로] 레티클 ──
+				reticle = new THREE.Mesh(
+					new THREE.RingGeometry( 0.15, 0.2, 32 ).rotateX( - Math.PI / 2 ),
+					new THREE.MeshBasicMaterial()
+				);
+				reticle.matrixAutoUpdate = false;
+				reticle.visible = false;
+				scene.add( reticle );
+
+				//
+
+				window.addEventListener( 'resize', onWindowResize );
+
+				// ── [추가] 진단 ──
+				const r = renderer.domElement.getBoundingClientRect();
+				xrlog( '캔버스 크기: ' + Math.round( r.width ) + ' x ' + Math.round( r.height )
+				     + ( r.height < 1 ? '  ← 높이 0!' : '  (정상)' ), r.height < 1 ? 'e' : '' );
+
+				renderer.xr.addEventListener( 'sessionstart', () => {
+
+					const s = renderer.xr.getSession();
+					const f = s.enabledFeatures;
+					xrlog( 'AR 세션 시작됨. enabledFeatures = ' + ( f ? JSON.stringify( f ) : '(미보고)' ), 'ok' );
+
+					if ( f ) {
+
+						if ( ! f.includes( 'anchors' ) )  xrlog( '경고: anchors 가 enabledFeatures 에 없습니다', 'e' );
+						if ( ! f.includes( 'hit-test' ) ) xrlog( '경고: hit-test 가 enabledFeatures 에 없습니다', 'e' );
+						if ( ! f.includes( 'camera-access' ) )
+							xrlog( 'camera-access 는 부여되지 않음 (optional 이므로 2단계 판정과 무관)', 'w' );
+
+					}
+
+					// 세션별 상태 초기화
+					reticleEverSeen = false;
+					distSamples = 0;
+					lastDistLogAt = 0;
+
+				} );
+
+				renderer.xr.addEventListener( 'sessionend', () => {
+
+					xrlog( 'AR 세션 종료됨. anchor ' + anchoredObjects.size + '개 생성됨. 위 로그를 확인하세요.' );
+
+				} );
+
+				xrlog( 'START AR 버튼 생성됨. 글자가 "AR NOT SUPPORTED" 면 폰에서 테스트하세요.' );
+
+			}
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			// ===================================================================
+			//  [직접 작성] anchor 생성
+			//
+			//  'select' 이벤트 핸들러에서 바로 만들지 않고 animate 안에서 만드는 이유:
+			//  XRHitTestResult 는 **그것을 얻은 프레임 안에서만 유효**하다. select 는
+			//  프레임 밖에서 발생하므로 그 시점의 hit 결과를 쓸 수 없다. 그래서
+			//  anchorRequested 플래그로 넘기고, 다음 프레임의 유효한 hit 로 생성한다.
+			// ===================================================================
+			function placeAnchor( hit, frame, referenceSpace ) {
+
+				// 1순위: hit 결과에 직접 anchor 를 붙인다 (실제 평면에 부착되어 더 안정적)
+				if ( typeof hit.createAnchor === 'function' ) {
+
+					hit.createAnchor().then(
+						anchor => onAnchorCreated( anchor, 'hit.createAnchor()' ),
+						err => {
+
+							xrlog( 'hit.createAnchor() 실패: ' + err.message + ' → frame.createAnchor() 재시도', 'w' );
+							fallbackAnchor( hit, frame, referenceSpace );
+
+						}
+					);
+
+				} else {
+
+					xrlog( 'hit.createAnchor 없음 → frame.createAnchor() 사용', 'w' );
+					fallbackAnchor( hit, frame, referenceSpace );
+
+				}
+
+			}
+
+			// 2순위: free-floating anchor. pose.transform 이 이미 XRRigidTransform 이다.
+			function fallbackAnchor( hit, frame, referenceSpace ) {
+
+				if ( typeof frame.createAnchor !== 'function' ) {
+
+					xrlog( 'frame.createAnchor 도 없음 → 이 브라우저는 anchors 미지원. 2단계 불가', 'e' );
+					return;
+
+				}
+
+				const pose = hit.getPose( referenceSpace );
+				if ( ! pose ) { xrlog( 'hit 포즈를 못 얻어 anchor 생성 취소', 'e' ); return; }
+
+				frame.createAnchor( pose.transform, referenceSpace ).then(
+					anchor => onAnchorCreated( anchor, 'frame.createAnchor()' ),
+					err => xrlog( 'frame.createAnchor() 실패: ' + err.message, 'e' )
+				);
+
+			}
+
+			function onAnchorCreated( anchor, how ) {
+
+				anchorSeq ++;
+
+				// 고정 큐브. 바닥에 올라앉도록 geometry 를 위로 올려둔다.
+				const mesh = new THREE.Mesh(
+					new THREE.BoxGeometry( 0.15, 0.15, 0.15 ).translate( 0, 0.075, 0 ),
+					new THREE.MeshPhongMaterial( { color: 0x00ff66 } )
+				);
+				mesh.matrixAutoUpdate = false;   // 포즈를 anchor 에서 직접 받아 쓴다
+				scene.add( mesh );
+
+				anchoredObjects.set( anchor, mesh );
+
+				xrlog( 'anchor #' + anchorSeq + ' 생성 성공 (' + how + '). 현재 ' + anchoredObjects.size + '개', 'ok' );
+
+			}
+
+			// ===================================================================
+			//  [직접 작성] 매 프레임 anchor 포즈 갱신 — "걸어가도 제자리"의 핵심.
+			//  큐브 좌표를 한 번 정해놓는 게 아니라, 매 프레임 ARCore 에게
+			//  "그 anchor 지금 어디야?" 를 다시 물어 갱신한다. 그래서 ARCore 가
+			//  공간 이해를 수정해도(loop closure) 큐브가 실제 위치를 따라간다.
+			// ===================================================================
+			function updateAnchors( frame, referenceSpace, viewerPos ) {
+
+				if ( anchoredObjects.size === 0 ) return;
+
+				const tracked = frame.trackedAnchors;   // XRAnchorSet (Set 유사)
+				let lost = 0;
+				let nearest = Infinity;
+
+				anchoredObjects.forEach( ( mesh, anchor ) => {
+
+					if ( tracked && ! tracked.has( anchor ) ) {
+
+						if ( mesh.visible ) {
+
+							mesh.visible = false;
+							xrlog( 'anchor 추적 상실 — trackedAnchors 에서 빠짐', 'w' );
+
+						}
+
+						lost ++;
+						return;
+
+					}
+
+					const pose = frame.getPose( anchor.anchorSpace, referenceSpace );
+
+					if ( ! pose ) { lost ++; return; }
+
+					if ( ! mesh.visible ) {
+
+						mesh.visible = true;
+						xrlog( 'anchor 추적 복귀', 'ok' );
+
+					}
+
+					mesh.matrix.fromArray( pose.transform.matrix );
+
+					if ( viewerPos ) {
+
+						const p = pose.transform.position;
+						const dx = p.x - viewerPos.x, dy = p.y - viewerPos.y, dz = p.z - viewerPos.z;
+						const d = Math.sqrt( dx * dx + dy * dy + dz * dz );
+						if ( d < nearest ) nearest = d;
+
+					}
+
+				} );
+
+				return { lost, nearest };
+
+			}
+
+			//
+
+			function animate( timestamp, frame ) {
+
+				if ( frame ) {
+
+					const referenceSpace = renderer.xr.getReferenceSpace();
+					const session = renderer.xr.getSession();
+
+					// ── [공식 그대로] hit-test source 요청 ──
+					if ( hitTestSourceRequested === false ) {
+
+						session.requestReferenceSpace( 'viewer' ).then( function ( refSpace ) {
+
+							session.requestHitTestSource( { space: refSpace } ).then( function ( source ) {
+
+								hitTestSource = source;
+								xrlog( 'hit-test source 생성 성공', 'ok' );
+
+							}, function ( err ) {
+
+								xrlog( 'requestHitTestSource 실패: ' + err.message, 'e' );
+
+							} );
+
+						}, function ( err ) {
+
+							xrlog( "requestReferenceSpace('viewer') 실패: " + err.message, 'e' );
+
+						} );
+
+						session.addEventListener( 'end', function () {
+
+							hitTestSourceRequested = false;
+							hitTestSource = null;
+
+						} );
+
+						hitTestSourceRequested = true;
+
+					}
+
+					// ── [공식 그대로 + anchor 생성 분기] ──
+					if ( hitTestSource ) {
+
+						const hitTestResults = frame.getHitTestResults( hitTestSource );
+
+						if ( hitTestResults.length ) {
+
+							const hit = hitTestResults[ 0 ];
+
+							reticle.visible = true;
+							reticle.matrix.fromArray( hit.getPose( referenceSpace ).transform.matrix );
+
+							if ( ! reticleEverSeen ) {
+
+								reticleEverSeen = true;
+								xrlog( '레티클 최초 표시 — 바닥 평면 감지됨', 'ok' );
+
+							}
+
+							if ( anchorRequested ) {
+
+								anchorRequested = false;
+								placeAnchor( hit, frame, referenceSpace );
+
+							}
+
+						} else {
+
+							reticle.visible = false;
+
+							if ( anchorRequested ) {
+
+								anchorRequested = false;
+								xrlog( '탭 시점에 평면이 없어 anchor 생성 취소', 'w' );
+
+							}
+
+						}
+
+					}
+
+					// ── [직접 작성] anchor 갱신 + HUD ──
+					const viewerPose = frame.getViewerPose( referenceSpace );
+					const viewerPos = viewerPose ? viewerPose.transform.position : null;
+
+					const st = updateAnchors( frame, referenceSpace, viewerPos );
+
+					updateHud( st, timestamp );
+
+				}
+
+				renderer.render( scene, camera );
+
+			}
+
+			// [추가] 세션 중 HUD. 눈대중으로는 ±15cm 판정이 불가하므로 숫자를 띄운다.
+			function updateHud( st, timestamp ) {
+
+				if ( ! hudEl ) return;
+
+				if ( ! st ) {
+
+					hudEl.innerHTML = reticle.visible
+						? '평면 감지됨 — 화면을 탭해 큐브를 고정하세요'
+						: '바닥을 천천히 겨누세요 (평면 탐색 중)';
+					return;
+
+				}
+
+				const dist = isFinite( st.nearest ) ? st.nearest.toFixed( 2 ) + 'm' : '—';
+				let line = '⚓ anchor ' + anchoredObjects.size + '개   거리 <span class="d">' + dist + '</span>';
+				if ( st.lost > 0 ) line += '\n<span class="warn">추적 상실 ' + st.lost + '개</span>';
+				else line += '\n추적 정상';
+				hudEl.innerHTML = line;
+
+				// 거리 추이를 로그에 남긴다 (걸어갔다 돌아온 증거). 3초 간격, 30개 상한.
+				if ( isFinite( st.nearest ) && distSamples < 30 && timestamp - lastDistLogAt > 3000 ) {
+
+					lastDistLogAt = timestamp;
+					distSamples ++;
+					xrlog( '거리 샘플 ' + distSamples + ': ' + st.nearest.toFixed( 3 ) + 'm'
+					     + ( st.lost > 0 ? '  (상실 ' + st.lost + '개)' : '' ) );
+
+				}
+
+			}
+
+		</script>
+	</body>
+</html>

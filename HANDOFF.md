@@ -107,13 +107,92 @@ PoC 단계에서 치를 비용이 아니다. **이 문서에 기록만 남긴다
 | **B** | **WebXR Anchor API** 전환 (SLAM 기반 공간 추적) | 무료·웹 유지. 안드로이드 ARCore 의존, 기종 편차 위험 |
 | **C** | **8th Wall** 유료 평가판 (상용급 SLAM) | 품질 최상·구현 빠름. 구독 비용, 벤더 종속 |
 
-### 다음 세션 작업
+### ✅ 결정: **옵션 B 확정** (2026-10-01)
 
-각 옵션의 **비용 · 학습곡선 · 현장 적용성**을 비교해 **결정까지** 낼 것.
-구현 착수는 결정 이후. (지금 코드를 건드리지 말 것 — 작동하는 데모가 유일한 자산이다.)
+| 옵션 | 결과 | 근거 |
+|---|---|---|
+| A | 탈락 | 마커 다중 배치 UX는 "검증단계에서 못 쓰겠다" 판정 받을 가능성이 큼 |
+| **B** | **채택** | 품질 적정 + 비용 0 + WebXR은 W3C 표준이라 미래 확장성 |
+| C | 보류 | 월 ~20만원 영구 의존. 지금 단계에 과투자 |
 
-> 참고: 현재 `ar.html` 의 `missTolerance: 5` / `warmupTolerance: 5` 는 추적 끊김을
-> 약간 버티게 하는 값이다. 옵션 A를 택하면 이 수치부터 조정해 볼 수 있다.
+> **분기 조건**: 사업이 진전되고 정확도 요구가 올라가면 C를 재검토한다.
+
+> 참고: `ar.html` 의 `missTolerance: 5` / `warmupTolerance: 5` 는 추적 끊김을
+> 약간 버티게 하는 값이다. 옵션 A로 되돌아갈 경우 이 수치부터 조정해 볼 수 있다.
+
+### ⚠️ 조사 결과 — B는 "MindAR → WebXR 전환"이 아니라 **"MindAR + WebXR 결합"**이다
+
+조사(2026-10-01, Chrome Platform Status API·Google ARCore 문서 직접 확인):
+
+| 기능 | Chrome Android | 플래그 |
+|---|---|---|
+| WebXR AR Module (`immersive-ar`) | Enabled by default (M81) | 불필요 |
+| **WebXR Anchors** | **Enabled by default (M79)** | 불필요 |
+| **WebXR Raw Camera Access** | **Enabled by default (M107)** | 불필요 |
+| **WebXR Image Tracking** | **"No active development"** | 플래그 있어도 **Chrome이 개발 중단** |
+
+**WebXR에는 쓸 수 있는 마커 인식 기능이 없다.** Google의 ARCore↔WebXR 비교표도
+"Augmented Images"를 **미지원**으로 명시한다. 따라서 마커 인식은 계속 MindAR이 담당하고,
+공간 추적만 WebXR anchors로 넘기는 **결합 구조**가 된다.
+
+**그 대신 `targets.mind` 는 재활용된다** (조사 전 전제는 "사용 불가"였으나 틀렸음).
+MindAR `Controller` 소스 확인 결과:
+
+```
+addImageTargets(fileURL)                        // './targets.mind' 그대로 로드
+async detect(input)                             // 임의 프레임 투입 가능 (canvas drawImage 기반)
+getWorldMatrix(modelViewTransform, targetIndex) // 포즈 행렬 반환
+```
+
+→ MindAR을 A-Frame 없이 **마커 인식 엔진으로만** 떼어 쓸 수 있다
+(`mindar-image.prod.js` = 코어 전용 빌드, CDN 200 확인).
+**버리는 것은 A-Frame 의존성뿐이고, 자산 4종은 전부 재활용된다.**
+
+**설계상 결정적 포인트**: 인식은 **1회만** 필요하다(마커 잡는 순간 anchor 생성 후 MindAR 종료).
+매 프레임 tfjs를 돌릴 필요가 없어 성능 부담이 급감한다.
+
+### 역방향 증분 계획 — 공식 예제에서 하나씩 더하기
+
+이번 세션에 효과를 본 전략(공식 예제 → 우리 것 추가)을 그대로 적용한다.
+
+| 단계 | 파일 | 증명 대상 | 상태 |
+|---|---|---|---|
+| **1** | `xr-test.html` | immersive-ar + 카메라 텍스처 접근 | ✅ **통과** (아래) |
+| **2** | `xr-test-2.html` | hit-test + anchors → 걸어가도 제자리 | 작성 완료, 검증 대기 |
+| 3 | 미작성 | MindAR Controller + 기존 `targets.mind` 로 1회 detect | 대기 |
+| 4 | 미작성 | `mep_test.glb` 얹기 + 기존 기본값 적용 | 대기 |
+
+> 1·2단계가 전체 리스크의 대부분이다. 2단계까지 통과하면 B 확정, 실패하면
+> 코드를 거의 안 버리고 C로 선회할 수 있다.
+
+### ✅ 1단계 완료 — `xr-test.html` (2026-10-01)
+
+**테스트 환경**: 갤럭시 S24 울트라 / Android Chrome (stable 155 계열) / GitHub Pages HTTPS
+
+```
+[7] AR 세션 시작됨. enabledFeatures = ["local","camera-access","viewer","dom-overlay"]
+[8] 카메라 텍스처 획득 성공 (886 × 1920) — 1단계 통과
+[10-12] 두 번째 세션 재현 — 동일 결과
+```
+
+| 확인 사항 | 결과 |
+|---|---|
+| `immersive-ar` 세션 승인 | ✅ |
+| `camera-access` 가 **enabledFeatures 에 실제 포함** | ✅ |
+| 카메라 WebGLTexture 획득 | ✅ **886 × 1920** |
+| 세션 재현성 | ✅ 2회 연속 동일 |
+| `dom-overlay` 자동 활성화 | ✅ **보너스** (요청 안 했는데 부여됨) |
+
+> **조사 때 "최대 기술 리스크"로 꼽았던 항목이 해소됐다.** WebXR 카메라가
+> opaque WebGLTexture 로만 나오는 점을 우려했으나, 획득 자체는 확실히 된다.
+> 남은 과제는 그 텍스처를 MindAR 이 요구하는 canvas 로 옮기는 blit 단계(3단계).
+>
+> `dom-overlay` 가 실제로 부여되는 것이 확인됐으므로, 2단계부터는 **세션 중
+> HUD**(거리 숫자)를 띄울 수 있다. ±15cm 판정은 눈대중으로 불가하므로 꼭 필요하다.
+
+**커밋 메시지 주의**: 1단계 커밋(`e95f43b`)의 메시지는 **"PC 로컬 로드 확인"**까지만
+적혀 있다. 폰 통과는 그 커밋 **이후**에 확인됐고, 메시지를 번복하지 않기로 해
+**이 문서가 폰 통과의 기록**이다.
 
 ---
 
@@ -145,7 +224,9 @@ PoC 단계에서 치를 비용이 아니다. **이 문서에 기록만 남긴다
 |---|---|---|---|
 | `ar.html` | 18.1 KB | MindAR AR 페이지 — **본체** | **로컬·폰 정상 작동.** 커밋됨 (`733150f`) |
 | `index.html` | 428 B | model-viewer 3D 뷰어 (AR 아님) | 정상 작동. 백업용 유지. 커밋됨 |
-| `test-official.html` | 4.6 KB | 공식 예제 복제 — **대조군** | 정상 작동. 커밋됨. **보존할 것** (향후 회귀 판별용) |
+| `test-official.html` | 4.6 KB | MindAR 공식 예제 복제 — **대조군** | 정상 작동. 커밋됨. **보존할 것** (회귀 판별용) |
+| `xr-test.html` | 11.2 KB | WebXR **1단계** (camera-access) — **대조군** | ✅ **로컬·폰 통과.** 커밋됨 (`e95f43b`). **보존할 것** |
+| `xr-test-2.html` | 19.6 KB | WebXR **2단계** (hit-test + anchors) | 작성 완료, **검증 대기.** 미커밋 |
 | `mep_test.glb` | 7.51 MB | Revit 변환 배관 모델 | 커밋됨. **AR에서 검증 완료** |
 | `targets.mind` | 256 KB | `marker.png` 학습 파일 | 커밋됨. **AR에서 검증 완료** |
 | `marker.png` | 61.7 KB | 마커 이미지 (= 공식 card.png) | 커밋됨. 인쇄본 보유 |
