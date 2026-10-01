@@ -1,70 +1,396 @@
 <!DOCTYPE html>
-<html>
+<html lang="ko">
 <head>
-  <title>MEP AR - Marker Test</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="https://cdn.jsdelivr.net/gh/hiukim/mind-ar-js@1.2.5/dist/mindar-image-three.prod.js"></script>
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.147.0/examples/jsm/"
-      }
-    }
-  </script>
+  <meta charset="utf-8">
+  <title>MEP AR - 마커 테스트</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+  <!-- ===================================================================
+       검증된 CDN 조합 (2026-07 기준 실제 HTTP 200 확인)
+         - A-Frame 1.6.0
+         - mind-ar 1.2.5  (npm 경로. gh/ 경로는 404이므로 절대 사용 금지)
+       두 파일 모두 일반 스크립트라 importmap 이 필요 없음.
+       순서 중요: A-Frame 이 반드시 MindAR 보다 먼저.
+       =================================================================== -->
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-aframe.prod.js"></script>
+
   <style>
-    body { margin: 0; overflow: hidden; }
-    #info {
-      position: fixed; top: 10px; left: 10px; z-index: 10;
-      background: rgba(0,0,0,0.6); color: white; padding: 8px 12px;
-      border-radius: 4px; font-family: sans-serif; font-size: 14px;
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #000;
+                 font-family: -apple-system, "Malgun Gothic", sans-serif; }
+
+    /* ===================================================================
+       [수정 2026-10-01] embedded 모드용 컨테이너.
+       공식 예제(example1.html)의 .example-container 와 동일한 역할.
+       embedded 를 쓰면 A-Frame 은 캔버스를 <a-scene> 의 부모 크기에 맞춘다.
+       이전에는 부모가 그냥 <body> 였고 body 에 height 가 없어서
+       캔버스가 height:0 으로 생성됨 → 마커 인식은 되지만 아무것도 안 그려짐.
+       (F12 확인: canvas.getBoundingClientRect() → width 2197.6 / height 0)
+
+       position:absolute 이고 위로 positioned 조상이 없으므로 height:100% 는
+       뷰포트(초기 컨테이닝 블록) 기준으로 계산된다. 따라서 html/body 에
+       height:100% 를 따로 안 걸어도 된다 — 공식 예제와 같은 방식.
+       =================================================================== */
+    #arContainer {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: 100%;
+      overflow: hidden;
     }
+
+    /* 상단 상태 표시줄 */
+    #status {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 30;
+      background: rgba(90,90,90,.9); color: #fff;
+      padding: 10px 12px; font-size: 14px; font-weight: 600;
+      border-bottom: 2px solid #666;
+      transition: background .1s;
+    }
+    #status.found { background: rgba(0,170,70,.95); border-bottom-color: #0f0; }
+    #status.err   { background: rgba(190,0,0,.95);  border-bottom-color: #f44; }
+    /* Found/Lost 횟수는 상태줄 안에 작게 붙인다 (폰에 콘솔이 없어 추적 안정성 확인용) */
+    #status .cnt { font-family: monospace; font-size: 12px; font-weight: 400;
+                   color: #ddd; margin-left: 8px; }
+
+    /* 우상단 버튼 */
+    #btns { position: fixed; top: 44px; right: 8px; z-index: 30; display: flex; gap: 6px; }
+    #btns button {
+      background: rgba(0,0,0,.7); color: #fff; border: 1px solid #666;
+      border-radius: 6px; padding: 8px 10px; font-size: 12px;
+    }
+
+    /* 조절 패널 */
+    #panel {
+      position: fixed; left: 8px; right: 8px; bottom: 8px; z-index: 30;
+      background: rgba(0,0,0,.78); color: #fff; border: 1px solid #555;
+      border-radius: 10px; padding: 10px 12px;
+    }
+    #panel.hide, #logbox.hide { display: none; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 7px 0; }
+    .row label { width: 96px; font-size: 12px; flex: none; }
+    .row input[type=range] { flex: 1; }
+    .row .val { width: 62px; text-align: right; font-size: 12px;
+                font-family: monospace; color: #7fdcff; flex: none; }
+    #resetBtn { width: 100%; margin-top: 6px; padding: 8px;
+                background: #333; color: #fff; border: 1px solid #777; border-radius: 6px; }
+
+    /* 에러/로그 창 */
+    #logbox {
+      position: fixed; left: 8px; right: 8px; bottom: 8px; z-index: 40;
+      max-height: 45vh; overflow-y: auto;
+      background: rgba(0,0,0,.92); color: #b6ffb6; border: 1px solid #0a0;
+      border-radius: 10px; padding: 10px; font-family: monospace; font-size: 11px;
+      line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+    }
+    #logbox .e { color: #ff8080; font-weight: bold; }
+    #logbox .w { color: #ffd280; }
   </style>
 </head>
 <body>
-  <div id="info">로딩 중...</div>
 
-  <script type="module">
-    import * as THREE from 'three';
-    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+  <div id="status"><span id="statusText">초기화 중...</span><span class="cnt" id="statusCnt"></span></div>
 
-    document.addEventListener('DOMContentLoaded', () => {
-      const start = async () => {
-        const mindarThree = new window.MINDAR.IMAGE.MindARThree({
-          container: document.body,
-          imageTargetSrc: './targets.mind',
-        });
+  <div id="btns">
+    <button id="panelBtn">조절</button>
+    <button id="logBtn">로그</button>
+  </div>
 
-        const { renderer, scene, camera } = mindarThree;
-        const anchor = mindarThree.addAnchor(0);
+  <!-- 크기 / 회전 조절 패널.
+       value 들은 아래 스크립트의 DEFAULTS 와 반드시 일치시킬 것 (초기화 버튼이 돌아갈 자리). -->
+  <div id="panel">
+    <div class="row">
+      <label>크기 배율</label>
+      <input type="range" id="sScale" min="-2" max="1" step="0.01" value="0">
+      <span class="val" id="vScale">1.00x</span>
+    </div>
+    <div class="row">
+      <label>X축 회전<br><span style="font-size:10px;color:#aaa">눕히기/세우기</span></label>
+      <input type="range" id="sRotX" min="-180" max="180" step="5" value="5">
+      <span class="val" id="vRotX">5°</span>
+    </div>
+    <div class="row">
+      <label>Y축 회전<br><span style="font-size:10px;color:#aaa">방향 돌리기</span></label>
+      <input type="range" id="sRotY" min="-180" max="180" step="5" value="95">
+      <span class="val" id="vRotY">95°</span>
+    </div>
+    <div class="row">
+      <label>높이 띄우기</label>
+      <input type="range" id="sLift" min="-1" max="1" step="0.02" value="0.94">
+      <span class="val" id="vLift">0.94</span>
+    </div>
+    <button id="resetBtn">초기값으로 되돌리기</button>
+  </div>
 
-        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
-        scene.add(light);
+  <!-- 로그 창 (기본 숨김) -->
+  <div id="logbox" class="hide"></div>
 
-        const loader = new GLTFLoader();
-        loader.load('./mep_test.glb', (gltf) => {
-          const model = gltf.scene;
-          model.scale.set(0.1, 0.1, 0.1);
-          model.position.set(0, 0, 0);
-          anchor.group.add(model);
-          document.querySelector("#info").innerText = "마커를 비추세요";
-        });
+  <!-- =================== AR 장면 ===================
+       <a-scene> 은 반드시 #arContainer 안에 있어야 함 (embedded 모드 캔버스 높이).
+       공식 예제의 <div class="example-container"> 와 같은 구조. -->
+  <div id="arContainer">
+  <a-scene
+    id="scene"
+    mindar-image="imageTargetSrc: ./targets.mind;
+                  filterMinCF: 0.0001; filterBeta: 0.001;
+                  missTolerance: 5; warmupTolerance: 5;
+                  uiScanning: no; uiLoading: no; uiError: no"
+    renderer="colorManagement: true; antialias: true"
+    vr-mode-ui="enabled: false"
+    device-orientation-permission-ui="enabled: false"
+    embedded>
 
-        anchor.onTargetFound = () => {
-          document.querySelector("#info").innerText = "마커 인식됨 ✓";
-        };
-        anchor.onTargetLost = () => {
-          document.querySelector("#info").innerText = "마커를 다시 비추세요";
-        };
+    <a-assets timeout="120000">
+      <a-asset-item id="mepModel" src="./mep_test.glb"></a-asset-item>
+    </a-assets>
 
-        await mindarThree.start();
-        renderer.setAnimationLoop(() => {
-          renderer.render(scene, camera);
-        });
-      };
+    <a-camera position="0 0 0" look-controls="enabled: false" cursor="fuse: false"></a-camera>
 
-      start();
+    <!-- 마커(타깃 0번) 위에 붙는 것들 -->
+    <a-entity mindar-image-target="targetIndex: 0">
+
+      <!-- rig: 사용자가 슬라이더로 조절하는 계층 -->
+      <a-entity id="rig">
+        <!-- fit: 모델 크기를 마커 기준으로 자동 정규화하는 계층 -->
+        <a-entity id="fit">
+          <a-gltf-model id="model" src="#mepModel"></a-gltf-model>
+        </a-entity>
+      </a-entity>
+
+    </a-entity>
+
+    <a-entity light="type: ambient; intensity: 2.0"></a-entity>
+    <a-entity light="type: directional; intensity: 2.0" position="1 2 1"></a-entity>
+    <a-entity light="type: directional; intensity: 1.2" position="-1 -1 -1"></a-entity>
+  </a-scene>
+  </div><!-- /#arContainer -->
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ===================================================================
+    //  확정된 기본값 (2026-10-01, 갤럭시 S24 울트라 + marker.png 기준)
+    //  사용자가 슬라이더로 직접 찾은 "자연스럽게 보이는" 값을 그대로 고정.
+    //  미세조정은 슬라이더로 계속 가능하고, [초기값으로 되돌리기] 는 여기로 돌아온다.
+    // ===================================================================
+
+    // 자동맞춤 목표 크기: 모델 최대변 = 마커 가로폭의 몇 칸인가.
+    // 종전 로직은 1칸(= autoScale 1.805e-2)이어서 너무 작았다.
+    // 슬라이더에서 추가로 7.24x 를 곱해야 적정 크기였으므로 그 값을 여기에 흡수한다.
+    // 슬라이더 쪽에 7.24x 로 남겨두지 않는 이유: 슬라이더 범위가 0.01x~10x 라
+    // 7.24 를 출발점으로 삼으면 위로 1.38배밖에 못 키운다. 자동맞춤에 넣어두면
+    // 슬라이더가 1.00x 중립에서 시작해 위아래로 여유가 생긴다.
+    var FIT_MARKER_SPAN = 7.24;
+
+    // 슬라이더 기본값. 아래 HTML <input value="..."> 와 반드시 일치시킬 것.
+    var DEFAULTS = {
+      scale: 0,      // 10^0 = 1.00x (중립. 실제 크기는 FIT_MARKER_SPAN 이 담당)
+      rotX:  5,      // 눕히기/세우기
+      rotY:  95,     // 방향 돌리기
+      lift:  0.94    // 마커 평면에서 띄우기 (+Z = 마커에서 카메라 쪽)
+    };
+
+    // ---------- 화면 내 로그 (폰에는 콘솔이 없으므로 필수) ----------
+    var logbox = document.getElementById('logbox');
+    var logCount = 0;
+    function log(msg, kind) {
+      logCount++;
+      var d = document.createElement('div');
+      if (kind) d.className = kind;
+      d.textContent = '[' + logCount + '] ' + msg;
+      logbox.appendChild(d);
+      logbox.scrollTop = logbox.scrollHeight;
+      if (kind === 'e') {                       // 에러는 로그창 자동 열기
+        logbox.classList.remove('hide');
+        document.getElementById('panel').classList.add('hide');
+      }
+    }
+    window.addEventListener('error', function (ev) {
+      log('JS 에러: ' + ev.message + ' @ ' + (ev.filename || '?') + ':' + (ev.lineno || '?'), 'e');
     });
+    window.addEventListener('unhandledrejection', function (ev) {
+      log('처리안된 실패: ' + (ev.reason && ev.reason.message ? ev.reason.message : ev.reason), 'e');
+    });
+
+    // ---------- 상태 표시줄 ----------
+    // Found/Lost 횟수는 같은 줄에 작게 덧붙인다 (폰에 콘솔이 없어 추적 안정성 확인용).
+    var statusEl   = document.getElementById('status');
+    var statusText = document.getElementById('statusText');
+    var statusCnt  = document.getElementById('statusCnt');
+    function setStatus(text, cls) {
+      statusText.textContent = text;
+      statusEl.className = cls || '';
+    }
+
+    // ---------- 사전 점검 ----------
+    log('페이지 시작. 주소=' + location.protocol + '//' + location.host);
+    if (location.protocol === 'file:') {
+      setStatus('오류: file:// 로 열면 작동 안 함. Live Server 로 여세요.', 'err');
+      log('file:// 프로토콜에서는 카메라와 targets.mind 로드가 모두 차단됩니다. '
+        + 'VS Code Live Server 또는 https 로 접속하세요.', 'e');
+      return;
+    }
+    if (!window.AFRAME)  { setStatus('오류: A-Frame 로드 실패', 'err'); log('AFRAME 없음 - 네트워크 확인', 'e'); return; }
+    if (!window.MINDAR)  { setStatus('오류: MindAR 로드 실패', 'err'); log('MINDAR 없음 - CDN 확인', 'e'); return; }
+    log('라이브러리 OK. A-Frame ' + AFRAME.version + ' / MindAR 로드됨');
+
+    var sceneEl = document.getElementById('scene');
+    var rigEl   = document.getElementById('rig');
+    var fitEl   = document.getElementById('fit');
+    var modelEl = document.getElementById('model');
+    var THREE   = AFRAME.THREE;
+
+    // ---------- 파일 존재 확인 ----------
+    ['./targets.mind', './mep_test.glb'].forEach(function (p) {
+      fetch(p, { method: 'HEAD' })
+        .then(function (r) {
+          if (r.ok) log('파일 OK: ' + p + ' (' + (r.headers.get('content-length') || '?') + ' bytes)');
+          else      log('파일 없음(' + r.status + '): ' + p, 'e');
+        })
+        .catch(function (e) { log('파일 확인 실패: ' + p + ' - ' + e.message, 'e'); });
+    });
+
+    // ---------- 모델 로딩 ----------
+    setStatus('모델 불러오는 중... (7.5MB, 잠시 기다리세요)');
+
+    var assetEl = document.getElementById('mepModel');
+    assetEl.addEventListener('progress', function (ev) {
+      if (ev.detail && ev.detail.totalBytes) {
+        var pct = Math.round(ev.detail.loadedBytes / ev.detail.totalBytes * 100);
+        setStatus('모델 불러오는 중... ' + pct + '%');
+      }
+    });
+
+    var autoScale = 1;   // 자동 정규화 배율 (모델 최대변 = 마커 가로폭 FIT_MARKER_SPAN 칸)
+
+    modelEl.addEventListener('model-loaded', function () {
+      try {
+        var obj = modelEl.getObject3D('mesh');
+        var box = new THREE.Box3().setFromObject(obj);
+        var size = new THREE.Vector3();   box.getSize(size);
+        var center = new THREE.Vector3(); box.getCenter(center);
+        var maxDim = Math.max(size.x, size.y, size.z);
+
+        log('모델 실측 크기: ' + size.x.toFixed(2) + ' x ' + size.y.toFixed(2)
+            + ' x ' + size.z.toFixed(2) + ' (모델 단위)');
+
+        if (!isFinite(maxDim) || maxDim <= 0) {
+          log('경고: 크기 측정 실패. 자동 맞춤 생략', 'w');
+        } else {
+          autoScale = FIT_MARKER_SPAN / maxDim;
+          // 모델 중심을 원점으로 이동 → 그 다음 계층에서 축소
+          modelEl.object3D.position.set(-center.x, -center.y, -center.z);
+          fitEl.object3D.scale.set(autoScale, autoScale, autoScale);
+          log('자동 맞춤 적용: 배율 ' + autoScale.toExponential(3)
+              + ' (모델 최대변 = 마커 가로폭 ' + FIT_MARKER_SPAN + '칸)');
+        }
+        setStatus('준비 완료 — 마커를 비추세요');
+      } catch (e) {
+        log('자동 맞춤 중 에러: ' + e.message, 'e');
+      }
+    });
+
+    modelEl.addEventListener('model-error', function (ev) {
+      setStatus('오류: GLB 모델 로드 실패', 'err');
+      log('GLB 로드 실패. 파일명/경로 확인: ./mep_test.glb', 'e');
+      log(JSON.stringify(ev.detail || {}), 'e');
+    });
+
+    // ---------- [진단] 캔버스 실제 크기 ----------
+    // height 가 0 이면 마커 인식은 되지만 아무것도 안 그려진다 (2026-10-01 원인).
+    // 폰에는 콘솔이 없으므로 화면 로그로 남긴다.
+    sceneEl.addEventListener('renderstart', function () {
+      var r = sceneEl.canvas.getBoundingClientRect();
+      var msg = '캔버스 크기: ' + Math.round(r.width) + ' x ' + Math.round(r.height);
+      if (r.height < 1) log(msg + '  ← 높이 0! 렌더링 불가', 'e');
+      else              log(msg + '  (정상)');
+    });
+
+    // ---------- MindAR 상태 ----------
+    sceneEl.addEventListener('arReady', function () {
+      log('AR 엔진 준비됨 (카메라 + targets.mind 정상)');
+      setStatus('마커를 비추세요');
+    });
+    sceneEl.addEventListener('arError', function (ev) {
+      setStatus('오류: AR 시작 실패 — 로그 확인', 'err');
+      log('AR 시작 실패. 원인 후보: 카메라 권한 거부 / https 아님 / targets.mind 손상', 'e');
+      log(JSON.stringify(ev.detail || {}), 'e');
+    });
+
+    // ---------- 마커 추적 상태 ----------
+    var foundCount = 0, lostCount = 0;
+    function updateCnt() {
+      statusCnt.textContent = 'F' + foundCount + ' / L' + lostCount;
+    }
+
+    var targetEl = document.querySelector('[mindar-image-target]');
+    targetEl.addEventListener('targetFound', function () {
+      foundCount++; updateCnt();
+      setStatus('● 인식 중', 'found');
+      log('targetFound (#' + foundCount + ')');
+    });
+    targetEl.addEventListener('targetLost', function () {
+      lostCount++; updateCnt();
+      setStatus('○ 놓침', '');
+      log('targetLost (#' + lostCount + ')');
+    });
+
+    // ---------- 슬라이더 ----------
+    var sScale = document.getElementById('sScale'), vScale = document.getElementById('vScale');
+    var sRotX  = document.getElementById('sRotX'),  vRotX  = document.getElementById('vRotX');
+    var sRotY  = document.getElementById('sRotY'),  vRotY  = document.getElementById('vRotY');
+    var sLift  = document.getElementById('sLift'),  vLift  = document.getElementById('vLift');
+
+    function apply() {
+      var mult = Math.pow(10, parseFloat(sScale.value));   // -2..1 → 0.01x .. 10x
+      var rx = parseFloat(sRotX.value);
+      var ry = parseFloat(sRotY.value);
+      var lift = parseFloat(sLift.value);
+
+      rigEl.object3D.scale.set(mult, mult, mult);
+      rigEl.object3D.rotation.set(
+        THREE.MathUtils.degToRad(rx),
+        THREE.MathUtils.degToRad(ry),
+        0
+      );
+      // lift 는 +Z(마커 평면에서 카메라 쪽) = 마커 기준 "위".
+      // 사용자가 0.94 를 찾은 축이 바로 이 Z 이므로 Y 로 바꾸지 않는다.
+      rigEl.object3D.position.set(0, 0, lift);
+
+      vScale.textContent = (mult < 0.1 ? mult.toFixed(3) : mult.toFixed(2)) + 'x';
+      vRotX.textContent  = rx + '°';
+      vRotY.textContent  = ry + '°';
+      vLift.textContent  = lift.toFixed(2);
+    }
+    [sScale, sRotX, sRotY, sLift].forEach(function (s) { s.addEventListener('input', apply); });
+
+    function resetToDefaults() {
+      sScale.value = DEFAULTS.scale;
+      sRotX.value  = DEFAULTS.rotX;
+      sRotY.value  = DEFAULTS.rotY;
+      sLift.value  = DEFAULTS.lift;
+      apply();
+    }
+
+    document.getElementById('resetBtn').addEventListener('click', function () {
+      resetToDefaults();
+      log('조절값을 확정 기본값으로 되돌림 (회전 ' + DEFAULTS.rotX + '/' + DEFAULTS.rotY
+          + '°, 띄우기 ' + DEFAULTS.lift + ').');
+    });
+
+    // 시작 시점에도 기본값을 적용한다. HTML 의 value 속성과 DEFAULTS 가 어긋나도
+    // 여기서 DEFAULTS 로 맞춰지므로 기준이 한 곳(DEFAULTS)으로 유지된다.
+    resetToDefaults();
+
+    // ---------- 버튼 ----------
+    document.getElementById('panelBtn').addEventListener('click', function () {
+      document.getElementById('panel').classList.toggle('hide');
+    });
+    document.getElementById('logBtn').addEventListener('click', function () {
+      logbox.classList.toggle('hide');
+    });
+
+  })();
   </script>
 </body>
 </html>
