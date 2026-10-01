@@ -208,7 +208,25 @@
 
 			// ── anchor 상태 (2단계에서 그대로) ──
 			const anchoredObjects = new Map();   // XRAnchor -> THREE.Object3D
-			let anchorCreated = false;
+			let anchorCreated = false;   // anchor 가 실제로 존재한다
+			let markerFound = false;     // MindAR 이 마커를 찾았다 (= detect 중단). anchorCreated 보다 먼저 선다.
+
+			// ── anchor 생성 대기 큐 ──
+			//
+			//  🔴 2026-10-01 버그 수정: XRFrame 은 **자신을 만들어낸 콜백 안에서만** 유효하다.
+			//     MindAR 의 detect()/match() 는 async 이고 50ms 쯤 걸리므로, await 가 끝난
+			//     시점의 frame 은 이미 죽은 객체(stale)다. 거기서 createAnchor 를 부르면
+			//       "XRFrame access outside the callback that produced it is invalid"
+			//     로 100% 거부된다 (폰 테스트에서 114회 전부 실패).
+			//
+			//  → 2단계(xr-test-2.html)의 hit-test 패턴과 **동일하게** 처리한다:
+			//     포즈는 플래그에 저장만 하고, 실제 createAnchor 는 **다음 프레임 콜백**에서 부른다.
+			//
+			//  포즈를 다시 계산하지 않아도 되는 이유: 저장하는 값이 이미 **기준공간(refSpace)
+			//  좌표로 변환 완료된** 위치·회전이다. 기준공간은 프레임에 종속되지 않으므로
+			//  다음 프레임에서 그대로 써도 같은 실제 위치를 가리킨다.
+			let pendingAnchor = null;    // { xform, dist, tries, inFlight }
+			const MAX_ANCHOR_TRIES = 60; // 약 1초(60fps). 이보다 오래 실패하면 포기하고 재인식
 
 			// ── MindAR 상태 ──
 			let mindarController = null;
@@ -319,7 +337,7 @@
 
 			function onSelect() {
 
-				if ( ! anchorCreated ) {
+				if ( ! markerFound ) {
 
 					xrlog( '탭 감지 — 아직 마커를 못 찾았습니다. 마커를 화면에 더 크게 담아보세요.', 'w' );
 					return;
@@ -335,9 +353,23 @@
 				} );
 				anchoredObjects.clear();
 				anchorCreated = false;
+				resetForRedetect();
+				xrlog( '탭 — anchor 삭제. MindAR 을 다시 초기화하고 재인식합니다.' );
+
+			}
+
+			// 마커를 다시 찾을 수 있는 상태로 되돌린다.
+			// stopMindAR() 이 dispose() 를 불렀으므로 Controller 는 **버리고 새로 만들어야** 한다.
+			// (dispose 된 Controller 로 detect 를 부르면 에러가 난다)
+			function resetForRedetect() {
+
+				pendingAnchor = null;
+				markerFound = false;
 				mindarStopped = false;
+				mindarController = null;
+				mindarReady = false;
+				mindarBusy = false;
 				detectAttempts = 0;
-				xrlog( '탭 — anchor 삭제하고 마커 재인식을 시작합니다.' );
 
 			}
 
@@ -522,8 +554,13 @@
 
 			}
 
-			// 1회 인식 시도
-			async function tryDetect( canvasInput, frame, view, referenceSpace ) {
+			// 1회 인식 시도.
+			//
+			// ⚠️ frame 을 넘기지 않는다. await 를 지나면 frame 이 stale 이 되므로
+			//    여기서 받아도 쓸 수 없다 (그게 바로 114회 실패의 원인이었다).
+			//    view 는 projectionMatrix·transform.matrix 값을 읽기만 하므로
+			//    호출 시점의 **숫자**를 미리 뽑아서 넘긴다.
+			async function tryDetect( canvasInput, viewProj11, viewMatrix ) {
 
 				mindarBusy = true;
 				detectAttempts ++;
@@ -562,7 +599,7 @@
 					xrlog( '✓ 마커 인식 성공! detect #' + detectAttempts + ' (' + ms.toFixed( 0 ) + 'ms)', 'ok' );
 
 					const worldMatrix = mindarController.getWorldMatrix( modelViewTransform, TARGET_INDEX );
-					onMarkerFound( worldMatrix, frame, view, referenceSpace );
+					onMarkerFound( worldMatrix, viewProj11, viewMatrix );
 
 				} catch ( e ) {
 
@@ -595,8 +632,12 @@
 			//
 			//  5) anchor 는 위치+회전만 받는다(XRRigidTransform 에 스케일 없음).
 			//     스케일은 콘텐츠에 따로 적용한다: 1 그룹단위 = MARKER_WIDTH_M 미터.
+			//
+			//  ⚠️ 이 함수는 **createAnchor 를 부르지 않는다.** async 체인을 지나온 상태라
+			//     XRFrame 이 이미 stale 이다. 변환 결과만 pendingAnchor 에 넣고,
+			//     실제 생성은 animate() 의 다음 프레임 콜백이 담당한다.
 			// ===================================================================
-			function onMarkerFound( worldMatrix, frame, view, referenceSpace ) {
+			function onMarkerFound( worldMatrix, viewProj11, viewMatrix ) {
 
 				// 1) MindAR 규약대로 조립
 				const mCamMarker = new THREE.Matrix4();
@@ -612,7 +653,7 @@
 				const markerWpx = markerDims[ 0 ];
 				const unitToM = MARKER_WIDTH_M / markerWpx;
 
-				const projReal = view.projectionMatrix[ 5 ];
+				const projReal = viewProj11;
 				const fovFix = USE_FOV_FIX ? ( projReal / MINDAR_PROJ_11 ) : 1;
 
 				const vfovReal = 2 * Math.atan( 1 / projReal ) * 180 / Math.PI;
@@ -627,9 +668,11 @@
 				xrlog( '마커 거리 — 보정전 ' + distRaw.toFixed( 3 ) + 'm → 보정후 '
 				     + distFixed.toFixed( 3 ) + 'm  (자로 재서 어느 쪽이 맞는지 알려주세요)', 'ok' );
 
-				// 4) 기준공간으로 변환
+				// 4) 기준공간으로 변환.
+				//    이 결과는 **프레임에 종속되지 않는다** — 기준공간 좌표이므로
+				//    다음 프레임에서 그대로 써도 같은 실제 위치를 가리킨다.
 				const mCamMarkerMetric = new THREE.Matrix4().compose( pos, quat, new THREE.Vector3( 1, 1, 1 ) );
-				const mRefCam = new THREE.Matrix4().fromArray( view.transform.matrix );
+				const mRefCam = new THREE.Matrix4().fromArray( viewMatrix );
 				const mRefMarker = new THREE.Matrix4().multiplyMatrices( mRefCam, mCamMarkerMetric );
 
 				const rPos = new THREE.Vector3();
@@ -639,14 +682,8 @@
 				xrlog( '기준공간 마커 위치 = ('
 				     + rPos.x.toFixed( 3 ) + ', ' + rPos.y.toFixed( 3 ) + ', ' + rPos.z.toFixed( 3 ) + ')' );
 
-				// 5) anchor 생성
-				if ( typeof frame.createAnchor !== 'function' ) {
-
-					xrlog( 'frame.createAnchor 없음 → anchor 생성 불가', 'e' );
-					return;
-
-				}
-
+				// 5) anchor 포즈를 **대기 큐에 넣기만** 한다.
+				//    XRFrame 은 지금 stale 이므로 여기서 createAnchor 를 부르면 무조건 거부된다.
 				let xform;
 				try {
 
@@ -662,9 +699,47 @@
 
 				}
 
-				anchorCreated = true;   // 중복 생성 방지를 먼저 걸어둔다 (createAnchor 는 비동기)
+				markerFound = true;   // detect 중단 (중복 인식 방지)
+				pendingAnchor = { xform: xform, dist: distFixed, tries: 0, inFlight: false };
 
-				frame.createAnchor( xform, referenceSpace ).then(
+				xrlog( 'pending anchor 생성 대기 중 — 다음 XR 프레임에서 createAnchor 호출', 'ok' );
+
+				// 포즈를 확보했으므로 MindAR 은 더 돌릴 필요가 없다 (tfjs 중단 = 성능 확보)
+				stopMindAR();
+
+			}
+
+			// ===================================================================
+			//  [2026-10-01 신규] 대기 중인 anchor 를 **현재 프레임**에서 생성한다.
+			//  animate() 안에서만 호출된다 → frame 이 살아있는 상태가 보장된다.
+			// ===================================================================
+			function tryCreatePendingAnchor( frame, referenceSpace ) {
+
+				const p = pendingAnchor;
+
+				if ( p.inFlight ) return;   // 앞선 호출이 아직 응답 전 — 중복 생성 방지
+
+				if ( typeof frame.createAnchor !== 'function' ) {
+
+					xrlog( 'frame.createAnchor 없음 → anchor 생성 불가', 'e' );
+					pendingAnchor = null;
+					return;
+
+				}
+
+				p.tries ++;
+
+				if ( p.tries > MAX_ANCHOR_TRIES ) {
+
+					xrlog( 'anchor 생성을 ' + MAX_ANCHOR_TRIES + '회 시도했으나 실패 — 포기하고 재인식합니다', 'e' );
+					resetForRedetect();
+					return;
+
+				}
+
+				p.inFlight = true;
+
+				frame.createAnchor( p.xform, referenceSpace ).then(
 					anchor => {
 
 						const group = buildMarkerContent();
@@ -672,15 +747,24 @@
 						scene.add( group );
 						anchoredObjects.set( anchor, group );
 
-						xrlog( 'anchor 생성 성공 — 이제 마커를 치워도/화면에서 벗어나도 유지됩니다', 'ok' );
+						anchorCreated = true;
+						pendingAnchor = null;
 
-						stopMindAR();
+						xrlog( 'anchor 생성 성공 (' + p.tries + '번째 프레임 시도) — '
+						     + '이제 마커를 치워도/화면에서 벗어나도 유지됩니다', 'ok' );
 
 					},
 					err => {
 
-						anchorCreated = false;
-						xrlog( 'createAnchor 실패: ' + err.message, 'e' );
+						p.inFlight = false;
+
+						// 매 프레임 로그를 쌓으면 폰이 느려진다. 처음과 10회 간격만 남긴다.
+						if ( p.tries === 1 || p.tries % 10 === 0 ) {
+
+							xrlog( 'createAnchor 실패 (' + p.tries + '회): ' + err.message
+							     + ' → 다음 프레임 재시도', 'w' );
+
+						}
 
 					}
 				);
@@ -810,8 +894,13 @@
 
 						const view = viewerPose.views.find( v => v.camera );
 
+						// ── anchor 생성 단계 ──
+						//  frame 이 **살아있는 지금** createAnchor 를 부른다. 이게 이 파일의 핵심 수정.
+						//  (인식 단계보다 먼저 둬서, 인식한 프레임 다음 프레임에 바로 생성되게 한다)
+						if ( pendingAnchor ) tryCreatePendingAnchor( frame, referenceSpace );
+
 						// ── 인식 단계 ──
-						if ( view && ! anchorCreated && ! blitFailed ) {
+						if ( view && ! markerFound && ! blitFailed ) {
 
 							let cameraTexture = null;
 							try {
@@ -854,7 +943,15 @@
 									if ( canvasInput ) {
 
 										// await 하지 않는다 — 렌더 루프를 막으면 안 된다.
-										tryDetect( canvasInput, frame, view, referenceSpace );
+										//
+										// frame 을 넘기지 않는다. tryDetect 는 await 를 지나므로
+										// 그 안에서 frame 은 이미 stale 이다. view 에서 필요한
+										// **숫자만** 지금 뽑아서 넘긴다 (view 객체도 프레임 종속).
+										tryDetect(
+											canvasInput,
+											view.projectionMatrix[ 5 ],
+											Array.from( view.transform.matrix )
+										);
 
 									}
 
@@ -883,9 +980,26 @@
 
 				if ( ! anchorCreated ) {
 
-					if ( blitFailed )      hudEl.innerHTML = '<span class="warn">카메라 캡처 실패 — ✕ 로 종료하고 로그를 확인하세요</span>';
-					else if ( ! mindarReady ) hudEl.innerHTML = 'MindAR 준비 중... (targets.mind 로드 + tf 워밍업)';
-					else                   hudEl.innerHTML = '마커를 비춰주세요\n<span class="d">시도 ' + detectAttempts + '회</span>';
+					if ( blitFailed ) {
+
+						hudEl.innerHTML = '<span class="warn">카메라 캡처 실패 — ✕ 로 종료하고 로그를 확인하세요</span>';
+
+					} else if ( pendingAnchor ) {
+
+						// 보통 1프레임이면 끝난다. 숫자가 계속 올라가면 anchor 생성 쪽 문제.
+						hudEl.innerHTML = '<span class="good">✓ 마커 인식됨</span>\n'
+						                + 'anchor 생성 중... <span class="d">(' + pendingAnchor.tries + ')</span>';
+
+					} else if ( ! mindarReady ) {
+
+						hudEl.innerHTML = 'MindAR 준비 중... (targets.mind 로드 + tf 워밍업)';
+
+					} else {
+
+						hudEl.innerHTML = '마커를 비춰주세요\n<span class="d">시도 ' + detectAttempts + '회</span>';
+
+					}
+
 					return;
 
 				}

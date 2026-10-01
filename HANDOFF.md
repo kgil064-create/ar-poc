@@ -293,6 +293,47 @@ M_카메라_마커 = Matrix4(controller.getWorldMatrix(mvt, idx)) × postMatrix
 > 이 값이 틀리면 anchor 가 엉뚱한 거리에 생긴다. 마커를 **다시 인쇄하면 반드시 재실측**할 것.
 > `xr-test-3.html` 은 URL 파라미터로 받으므로 코드 수정 없이 바꿀 수 있다 (기본값 0.10m).
 
+### 🔴 WebXR 최대 함정 — `XRFrame` 은 자신을 만든 콜백 안에서만 유효하다
+
+**3단계 1차 폰 테스트에서 `createAnchor` 가 114회 전부 실패했다.** 에러 메시지:
+
+```
+Failed to execute 'createAnchor' on 'XRFrame':
+XRFrame access outside the callback that produced it is invalid.
+```
+
+원인: MindAR 의 `detect()` / `match()` 가 **async 이고 50ms 쯤 걸린다.** `await` 를 지나면
+WebXR 은 이미 다음 프레임으로 넘어가 있어 손에 든 `frame` 이 죽은 객체(stale)가 된다.
+
+**해결 패턴 — 프레임을 넘기지 말고, 결과를 플래그에 담아 다음 프레임에서 처리한다:**
+
+```
+animate(frame) → 캡처 → tryDetect(숫자만 전달) → await … → pendingAnchor = {xform}
+animate(frame') → if (pendingAnchor) frame'.createAnchor(...)    ← 살아있는 프레임
+```
+
+**이 함정은 `frame` 하나에 국한되지 않는다. 프레임에 종속된 모든 객체가 같다:**
+
+| 객체 | 주의 |
+|---|---|
+| `XRFrame` | await 뒤에서 **모든 메서드** 사용 불가 |
+| `XRView` | `projectionMatrix`, `transform` 접근 불가 → **숫자만 미리 뽑아둘 것** |
+| `XRHitTestResult` | 그 프레임 안에서만 유효 (2단계에서 이미 처리함) |
+| `view.transform.matrix` | `Float32Array` 원본은 무효화될 수 있음 → **`Array.from()` 으로 복사** |
+| 카메라 텍스처 (`getCameraTexture`) | 그 프레임 안에서만 유효 |
+
+> **4단계 주의**: `mep_test.glb` 로딩도 async 다 (`GLTFLoader`). 로드 완료 콜백에서
+> `frame` 을 쓰려 하면 같은 문제가 난다. **콘텐츠 로딩과 anchor 생성을 분리할 것** —
+> anchor 는 프레임 안에서 먼저 만들고, 모델은 나중에 그 anchor 에 붙인다.
+
+### 2차 결함으로 함께 고친 것 (`1dc79b3` → 수정 커밋)
+
+- **dispose 된 Controller 재사용 금지**: `stopMindAR()` 이 `dispose()` 를 부르므로
+  재인식 시 `mindarController = null` 로 버리고 새로 만들어야 한다 (`resetForRedetect()`).
+- **`createAnchor` 중복 호출 방지**: Promise 라서 매 프레임 부르면 anchor 가 수십 개 생긴다.
+  `inFlight` 플래그 + `MAX_ANCHOR_TRIES = 60`.
+- **로그 폭주 방지**: 1차 테스트에서 같은 에러가 109줄 쌓였다. 1회·10회 간격만 남긴다.
+
 ---
 
 ## 5. 그 외 백로그 (우선순위 낮음)
